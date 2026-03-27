@@ -5,9 +5,40 @@
 #+OPTIONS: toc:3 num:t ^:nil
 #+PROPERTY: header-args :mkdirp yes
 
-* 概要と設計思想
+* クイックスタート
 :PROPERTIES:
-:CUSTOM_ID: overview
+:CUSTOM_ID: quickstart
+:END:
+
+#+BEGIN_SRC bash :tangle no
+# セットアップ
+uv sync
+
+# 一般音源の採譜
+uv run retranscribe analyze ./input/song.flac \
+  --title "曲タイトル" \
+  --artist "アーティスト名" \
+  --output ./output/
+
+# Suno音源の採譜（URLから自動取得）
+uv run retranscribe-suno \
+  --source "https://suno.com/song/abc-123" \
+  --title "8ビットの夜風" \
+  --lyrics ~/Downloads/lyrics.txt \
+  --org-library ~/Music/suno_library.org
+
+# Suno音源の採譜（ローカルMP3）
+uv run retranscribe-suno \
+  --source ~/Downloads/8ビットの夜風.mp3 \
+  --title "8ビットの夜風" \
+  --lyrics ~/Downloads/lyrics.txt \
+  --style "j-pop, lo-fi, 8bit" \
+  --output ~/Music/suno/8ビットの夜風
+#+END_SRC
+
+* 設計思想
+:PROPERTIES:
+:CUSTOM_ID: design
 :END:
 
 ** なぜ「多仮説 → 再採点」か
@@ -26,6 +57,19 @@
 
 Basic Pitch の公式ドキュメントは、*一度に一楽器* を入力したときに最も良く機能すると明記している。
 そのため本システムでは Demucs で stem 分離してから各 stem に対して個別に仮説生成を行う。
+
+** 再採点の重み付け
+
+| スコア成分 | 重み | 内容 |
+|---|---|---|
+| スペクトル差（MFCC L2） | 50% | 簡易再合成との周波数特性比較 |
+| オンセット差 | 30% | 拍位置との整合性 |
+| ピッチ安定性（F0分散） | 20% | 連続F0の分散の逆数 |
+
+* アーキテクチャ
+:PROPERTIES:
+:CUSTOM_ID: architecture
+:END:
 
 ** パイプライン全体図
 
@@ -88,10 +132,7 @@ Basic Pitch の公式ドキュメントは、*一度に一楽器* を入力し�
 └──────────────────────────────────────┘
 #+END_SRC
 
-* プロジェクト構成
-:PROPERTIES:
-:CUSTOM_ID: project-structure
-:END:
+** プロジェクト構成
 
 #+BEGIN_SRC
 retranscribe/
@@ -121,18 +162,12 @@ retranscribe/
         └── cli_suno.py         ← retranscribe-suno エントリポイント
 #+END_SRC
 
-* Tangle 設定
+* インストールと設定
 :PROPERTIES:
-:CUSTOM_ID: tangle-settings
+:CUSTOM_ID: installation
 :END:
 
-#+BEGIN_SRC emacs-lisp :tangle no
-;; M-x org-babel-tangle  または  C-c C-v t
-;; .dir-locals.el に置くと保存時に自動 tangle:
-((org-mode . ((eval . (add-hook 'after-save-hook #'org-babel-tangle nil t)))))
-#+END_SRC
-
-* pyproject.toml
+** pyproject.toml
 :PROPERTIES:
 :CUSTOM_ID: pyproject
 :END:
@@ -229,7 +264,33 @@ target-version = "py310"
 | requests | HTTP | Suno __NEXT_DATA__ スクレイピング |
 | yt-dlp | ダウンロード | Suno URL からの MP3 取得 |
 
-* retranscribe/__init__.py
+** Tangle 設定
+:PROPERTIES:
+:CUSTOM_ID: tangle-settings
+:END:
+
+このファイルを =org-babel-tangle= することで全ソースが生成される。
+あるいは =org_tangle.py= を使って Emacs なしで展開できる。
+
+#+BEGIN_SRC emacs-lisp :tangle no
+;; M-x org-babel-tangle  または  C-c C-v t
+;; .dir-locals.el に置くと保存時に自動 tangle:
+((org-mode . ((eval . (add-hook 'after-save-hook #'org-babel-tangle nil t)))))
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle no
+# Emacs なしで tangle する場合
+python org_tangle.py README.org
+python org_tangle.py README.org --dry-run   # 確認のみ
+python org_tangle.py README.org --file retranscribe/suno/ingest.py  # 1ファイルだけ
+#+END_SRC
+
+* コアパイプライン
+:PROPERTIES:
+:CUSTOM_ID: core-pipeline
+:END:
+
+** パッケージ初期化: retranscribe/__init__.py
 :PROPERTIES:
 :CUSTOM_ID: init
 :END:
@@ -240,10 +301,12 @@ target-version = "py310"
 __version__ = "0.2.0"
 #+END_SRC
 
-* 音声前処理: preprocess.py
+** 音声前処理: preprocess.py
 :PROPERTIES:
 :CUSTOM_ID: preprocess
 :END:
+
+ffmpeg で任意フォーマット → WAV (mono/44.1kHz) 変換後、librosa でピーク正規化を行う。
 
 #+BEGIN_SRC python :tangle retranscribe/preprocess.py
 """音声前処理モジュール.
@@ -293,10 +356,12 @@ def to_wav(input_path: pathlib.Path, output_dir: pathlib.Path) -> pathlib.Path:
     return out_path
 #+END_SRC
 
-* エントリポイント: cli.py
+** エントリポイント: cli.py
 :PROPERTIES:
 :CUSTOM_ID: cli
 :END:
+
+=analyze= サブコマンドを提供する。typer + rich によるプログレスバー付き CLI。
 
 #+BEGIN_SRC python :tangle retranscribe/cli.py
 """retranscribe CLI — analyze サブコマンド."""
@@ -407,10 +472,13 @@ if __name__ == "__main__":
     app()
 #+END_SRC
 
-* Stem 分離: stems/demucs6s.py
+** Stem 分離: stems/demucs6s.py
 :PROPERTIES:
 :CUSTOM_ID: stems-demucs
 :END:
+
+=htdemucs_6s= モデルで drums / bass / other / vocals / guitar / piano の 6 stem を分離する。
+subprocess 経由で呼び出すことで進捗表示とタイムアウト制御を両立している。
 
 #+BEGIN_SRC python :tangle retranscribe/stems/demucs6s.py
 """Demucs 6-stem 分離モジュール."""
@@ -456,10 +524,13 @@ def separate_stems(
     return stems
 #+END_SRC
 
-* ビート追跡: beats/tracking.py
+** ビート追跡: beats/tracking.py
 :PROPERTIES:
 :CUSTOM_ID: beats-tracking
 :END:
+
+madmom を優先し、インポート失敗時は librosa にフォールバックする。
+madmom の DBN ベースのトラッカーは拍子変化に強く、複合拍子楽曲でも安定する。
 
 #+BEGIN_SRC python :tangle retranscribe/beats/tracking.py
 """ビート追跡モジュール.
@@ -527,10 +598,14 @@ def _track_librosa(wav_path: pathlib.Path) -> dict[str, Any]:
     }
 #+END_SRC
 
-* ASR: asr/whisperx_align.py
+** ASR: asr/whisperx_align.py
 :PROPERTIES:
 :CUSTOM_ID: asr-whisperx
 :END:
+
+WhisperX で vocals stem から歌詞を認識し、単語レベルのタイムスタンプを取得する。
+Suno 音源の場合は =suno/lyrics_align.py= が歌詞テキストを参照テキストとして渡すため、
+本モジュールは一般音源向けの自由 ASR として機能する。
 
 #+BEGIN_SRC python :tangle retranscribe/asr/whisperx_align.py
 """WhisperX による歌詞 ASR と単語レベルタイムスタンプ取得."""
@@ -568,10 +643,16 @@ def align_lyrics(
     return result
 #+END_SRC
 
-* 音符検出: notes/basic_pitch_poly.py
+** 音符検出: notes/
 :PROPERTIES:
-:CUSTOM_ID: notes-basic-pitch
+:CUSTOM_ID: notes
 :END:
+
+*** basic_pitch_poly.py — 多声検出
+
+Spotify の Basic Pitch を使い、onset / pitch / velocity の 3 出力から音符列を生成する。
+パラメータグリッド（onset_threshold × frame_threshold）を仮説数分スイープし、
+多仮説を生成する起点となる。
 
 #+BEGIN_SRC python :tangle retranscribe/notes/basic_pitch_poly.py
 """Basic Pitch による多声音符検出."""
@@ -629,10 +710,10 @@ def predict_notes(
         return sorted(notes, key=lambda x: x["start"])
 #+END_SRC
 
-* 音符検出: notes/crepe_refine.py
-:PROPERTIES:
-:CUSTOM_ID: notes-crepe
-:END:
+*** crepe_refine.py — 単旋律 F0 精密化
+
+torchcrepe の tiny モデルで連続 F0 を推定する。ビブラートやグリッサンドのある
+vocals / guitar stem での精度向上に寄与する。
 
 #+BEGIN_SRC python :tangle retranscribe/notes/crepe_refine.py
 """torchcrepe による単旋律 F0 精密化."""
@@ -686,10 +767,10 @@ def refine_f0(
     }
 #+END_SRC
 
-* 音符検出: notes/onsets_frames.py
-:PROPERTIES:
-:CUSTOM_ID: notes-onsets-frames
-:END:
+*** onsets_frames.py — piano 専用（optional）
+
+magenta の Onsets and Frames モデルを使うオプショナルラッパー。
+magenta 未インストール環境では ImportError を返し、hypotheses.py が try/except で吸収する。
 
 #+BEGIN_SRC python :tangle retranscribe/notes/onsets_frames.py
 """Onsets and Frames piano 専用ラッパー（optional）.
@@ -723,10 +804,10 @@ def predict_piano(stem_wav: pathlib.Path) -> list[dict]:
     )
 #+END_SRC
 
-* 多仮説生成: notes/hypotheses.py
-:PROPERTIES:
-:CUSTOM_ID: notes-hypotheses
-:END:
+*** hypotheses.py — 多仮説生成
+
+各 stem に対して Basic Pitch のパラメータグリッドをスイープし、
+crepe の F0 精密化仮説を追加して仮説束を構築する。
 
 #+BEGIN_SRC python :tangle retranscribe/notes/hypotheses.py
 """stem ごとの多仮説生成モジュール."""
@@ -821,10 +902,13 @@ def generate_all_hypotheses(
     return all_hyps
 #+END_SRC
 
-* 再採点: rescore/resynth.py
+** 再採点: rescore/resynth.py
 :PROPERTIES:
 :CUSTOM_ID: rescore-resynth
 :END:
+
+各 stem の仮説を「簡易再合成 → 元音源との差分」でスコアリングし最良仮説を選ぶ。
+スペクトル差 50% / オンセット差 30% / ピッチ安定性 20% の重み付きスコア。
 
 #+BEGIN_SRC python :tangle retranscribe/rescore/resynth.py
 """再合成誤差ベースの仮説再採点モジュール.
@@ -943,10 +1027,13 @@ def rescore_hypotheses(
     return best
 #+END_SRC
 
-* コード推定: chords/estimation.py
+** コード推定: chords/estimation.py
 :PROPERTIES:
 :CUSTOM_ID: chords-estimation
 :END:
+
+librosa のクロマ特徴量と主要コードテンプレートの内積でコード列を推定する。
+より高精度な推定が必要な場合は Chordino プラグインとの差し替えを推奨する。
 
 #+BEGIN_SRC python :tangle retranscribe/chords/estimation.py
 """コード推定モジュール.
@@ -1016,10 +1103,13 @@ def estimate_chords(
     return chords
 #+END_SRC
 
-* エクスポート: score/musicxml_export.py
+** エクスポート: score/musicxml_export.py
 :PROPERTIES:
 :CUSTOM_ID: score-export
 :END:
+
+最良仮説から MIDI（pretty_midi）と MusicXML（music21）を生成し、
+MuseScore CLI で PDF に変換する。歌詞タイムスタンプは MIDI Lyric イベントとして埋め込む。
 
 #+BEGIN_SRC python :tangle retranscribe/score/musicxml_export.py
 """MusicXML / MIDI / PDF エクスポートモジュール."""
@@ -1160,10 +1250,13 @@ def _stem_to_program(stem_name: str) -> int:
 :CUSTOM_ID: suno-subsystem
 :END:
 
-Sunoで生成した楽曲をretranscribeパイプラインに取り込むための拡張モジュール群。
+Suno で生成した楽曲を retranscribe パイプラインに取り込むための拡張モジュール群。
 =retranscribe-suno= コマンドとして独立したエントリポイントを持つ。
 
 ** 設計方針
+:PROPERTIES:
+:CUSTOM_ID: suno-design
+:END:
 
 | フィールド | 取得方法 | 確実性 |
 |---|---|---|
@@ -1171,13 +1264,25 @@ Sunoで生成した楽曲をretranscribeパイプラインに取り込むため�
 | =bpm= | =librosa= による音声解析（手動不要） | ◎ |
 | =key= | クロマ解析 + Krumhansl-Schmuckler アルゴリズム | ○ |
 
+Suno のページ構造は変更されやすいため、スクレイピング失敗時は =style= を空のままにして続行する。
+BPM と Key は音声から確実に取得できるため手動指定不要。
+
 ** suno/__init__.py
+:PROPERTIES:
+:CUSTOM_ID: suno-init
+:END:
 
 #+BEGIN_SRC python :tangle retranscribe/suno/__init__.py
 """Suno AI音楽生成サービス対応サブパッケージ."""
 #+END_SRC
 
-** suno/ingest.py — メタデータ取得・BPM/Key自動解析・WAV変換
+** suno/ingest.py — メタデータ取得・BPM/Key 自動解析・WAV 変換
+:PROPERTIES:
+:CUSTOM_ID: suno-ingest
+:END:
+
+URL が渡された場合は =__NEXT_DATA__= スクレイピングでスタイルタグを自動取得し、
+yt-dlp で MP3 をダウンロードする。BPM と Key は WAV 変換後に音声解析で自動推定する。
 
 #+BEGIN_SRC python :tangle retranscribe/suno/ingest.py
 """Suno音源の取り込みモジュール.
@@ -1508,7 +1613,14 @@ def ingest(
     return wav_path, meta
 #+END_SRC
 
-** suno/pitch_fix.py — AI生成音声のF0安定化
+** suno/pitch_fix.py — AI 生成音声の F0 安定化
+:PROPERTIES:
+:CUSTOM_ID: suno-pitch-fix
+:END:
+
+Suno のボーカルは微細なピッチドリフトを含む場合がある。
+torchcrepe で F0 を推定し、中央値フィルタで平滑化して npz に保存する。
+音声そのものは書き直さず、後段の crepe_refine.py が参照できる形で出力する。
 
 #+BEGIN_SRC python :tangle retranscribe/suno/pitch_fix.py
 """Suno AI生成音声向けF0安定化モジュール."""
@@ -1600,6 +1712,12 @@ def fix_pitch(
 #+END_SRC
 
 ** suno/lyrics_align.py — 歌詞の強制アライン
+:PROPERTIES:
+:CUSTOM_ID: suno-lyrics-align
+:END:
+
+Suno の歌詞テキストをセクション記号除去後に WhisperX の参照テキストとして渡す。
+自由 ASR より単語レベルタイムスタンプの精度が高くなる。
 
 #+BEGIN_SRC python :tangle retranscribe/suno/lyrics_align.py
 """Suno歌詞テキストを参照としたWhisperX強制アライン."""
@@ -1658,7 +1776,14 @@ def align_suno_lyrics(
     return result
 #+END_SRC
 
-** suno/export.py — MIDI/MusicXML/Org出力
+** suno/export.py — MIDI/MusicXML/Org 出力
+:PROPERTIES:
+:CUSTOM_ID: suno-export
+:END:
+
+既存の =score/musicxml_export.py= をラップし、MusicXML にスタイルタグを埋め込む。
+Org-mode ライブラリ（=suno_library.org=）にエントリを追記し、
+Hugo ブログ向けのフロントマター付き Markdown も生成できる。
 
 #+BEGIN_SRC python :tangle retranscribe/suno/export.py
 """Suno対応エクスポートモジュール."""
@@ -1836,6 +1961,9 @@ def export_suno(
 #+END_SRC
 
 ** suno/cli_suno.py — retranscribe-suno エントリポイント
+:PROPERTIES:
+:CUSTOM_ID: suno-cli
+:END:
 
 #+BEGIN_SRC python :tangle retranscribe/suno/cli_suno.py
 """retranscribe-suno CLI."""
@@ -1972,41 +2100,19 @@ if __name__ == "__main__":
     app()
 #+END_SRC
 
-* 使用方法
+* 開発者向け情報
 :PROPERTIES:
-:CUSTOM_ID: usage
+:CUSTOM_ID: developer-notes
 :END:
 
-#+BEGIN_SRC bash :tangle no
-# セットアップ
-uv sync
+** 既知の制限事項
 
-# 一般音源の採譜
-uv run retranscribe analyze ./input/song.flac \
-  --title "曲タイトル" \
-  --artist "アーティスト名" \
-  --output ./output/
+- Suno の =__NEXT_DATA__= スクレイピングはページ構造変更で無効化される可能性がある
+- magenta（Onsets and Frames）は pip install magenta で別途手動インストールが必要
+- torchaudio は 2.7 系に固定（LazyModule resample エラー回避のため）
+- madmom は build 時に Cython と numpy が必要（=uv.extra-build-dependencies= で対処済み）
 
-# Suno音源の採譜（URLから自動取得）
-uv run retranscribe-suno \
-  --source "https://suno.com/song/abc-123" \
-  --title "8ビットの夜風" \
-  --lyrics ~/Downloads/lyrics.txt \
-  --org-library ~/Music/suno_library.org
-
-# Suno音源の採譜（ローカルMP3）
-uv run retranscribe-suno \
-  --source ~/Downloads/8ビットの夜風.mp3 \
-  --title "8ビットの夜風" \
-  --lyrics ~/Downloads/lyrics.txt \
-  --style "j-pop, lo-fi, 8bit" \
-  --output ~/Music/suno/8ビットの夜風
-#+END_SRC
-
-* ライセンスメモ
-:PROPERTIES:
-:CUSTOM_ID: license-notes
-:END:
+** ライセンス
 
 | パッケージ | ライセンス | 商用利用 |
 |---|---|---|
