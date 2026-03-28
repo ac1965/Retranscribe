@@ -529,7 +529,7 @@ subprocess 経由で呼び出すことで進捗表示とタイムアウト制御
 from __future__ import annotations
 
 import pathlib
-import warnings
+import subprocess
 
 STEMS_6 = ["drums", "bass", "other", "vocals", "guitar", "piano"]
 
@@ -540,63 +540,32 @@ def separate_stems(
     device: str = "cpu",
     model: str = "htdemucs_6s",
     verbose: bool = False,
-    segment: int = 7,
 ) -> dict[str, pathlib.Path]:
-    """Demucs で 6-stem 分離を実行し、stem名→WAVパスの辞書を返す.
-
-    subprocess 経由ではなく Python API を直接呼び出す。
-    segment を小さくすることで torchaudio 2.8 のパディング AssertionError を回避する。
-    """
-    import torch
-    import torchaudio
-    from demucs.pretrained import get_model
-    from demucs.apply import apply_model
-
+    """Demucs で 6-stem 分離を実行し、stem名→WAVパスの辞書を返す."""
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    wav_path = pathlib.Path(wav_path)
 
-    if not verbose:
-        warnings.filterwarnings("ignore")
+    sink = None if verbose else subprocess.DEVNULL
+    subprocess.run(
+        [
+            "python", "-m", "demucs",
+            "-n", model,
+            "-d", device,
+            "-o", str(output_dir),
+            str(wav_path),
+        ],
+        check=True,
+        stdout=sink,
+        stderr=sink,
+    )
 
-    # モデルロード
-    demucs_model = get_model(model)
-    demucs_model.eval()
-    if device != "cpu":
-        demucs_model.to(device)
-
-    # 音声ロード → モデルのサンプルレートにリサンプル
-    waveform, sr = torchaudio.load(str(wav_path))
-    if sr != demucs_model.samplerate:
-        waveform = torchaudio.functional.resample(waveform, sr, demucs_model.samplerate)
-
-    # モノラル → ステレオ
-    if waveform.shape[0] == 1:
-        waveform = waveform.repeat(2, 1)
-
-    # 推論
-    with torch.no_grad():
-        sources = apply_model(
-            demucs_model,
-            waveform[None],          # (1, 2, T)
-            device=device,
-            segment=segment,         # chunk サイズ（秒）。小さくするとVRAM節約・padding回避
-            overlap=0.25,
-            progress=verbose,
-        )
-    sources = sources[0]             # (n_stems, 2, T)
-
-    # stem ごとに WAV 保存
-    stem_dir = output_dir / model / wav_path.stem
-    stem_dir.mkdir(parents=True, exist_ok=True)
+    # demucs の出力: output_dir/model/track_stem/{stem}.wav
+    stem_dir = output_dir / model / pathlib.Path(wav_path).stem
     stems: dict[str, pathlib.Path] = {}
-
-    for i, stem_name in enumerate(demucs_model.sources):
-        if stem_name not in STEMS_6:
-            continue
-        out_path = stem_dir / f"{stem_name}.wav"
-        torchaudio.save(str(out_path), sources[i].cpu(), demucs_model.samplerate)
-        stems[stem_name] = out_path
+    for stem_name in STEMS_6:
+        p = stem_dir / f"{stem_name}.wav"
+        if p.exists():
+            stems[stem_name] = p
 
     return stems
 #+END_SRC

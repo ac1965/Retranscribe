@@ -1,3 +1,35 @@
+Metadata-Version: 2.4
+Name: retranscribe
+Version: 0.2.0
+Summary: Multi-hypothesis audio transcription with resynth rescoring
+Requires-Python: <3.13,>=3.10
+Description-Content-Type: text/plain
+Requires-Dist: demucs>=4.0.0
+Requires-Dist: madmom>=0.16.1
+Requires-Dist: librosa>=0.10.0
+Requires-Dist: whisperx>=3.8.4
+Requires-Dist: basic-pitch>=0.4.0
+Requires-Dist: torchcrepe>=0.0.24
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: scipy>=1.10.0
+Requires-Dist: soundfile>=0.12.0
+Requires-Dist: mir-eval>=0.7.0
+Requires-Dist: music21>=9.1.0
+Requires-Dist: pretty-midi>=0.2.10
+Requires-Dist: torch==2.8.*
+Requires-Dist: torchaudio==2.8.*
+Requires-Dist: setuptools<81,>=68
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: yt-dlp>=2024.1.0
+Requires-Dist: typer>=0.9.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: pathlib2>=2.3.7
+Provides-Extra: piano
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: ruff>=0.1.0; extra == "dev"
+
 #+TITLE: retranscribe — 多仮説・再採点型 耳コピ自動化システム
 #+AUTHOR: retranscribe project
 #+DATE: 2026-03-27
@@ -529,7 +561,7 @@ subprocess 経由で呼び出すことで進捗表示とタイムアウト制御
 from __future__ import annotations
 
 import pathlib
-import warnings
+import subprocess
 
 STEMS_6 = ["drums", "bass", "other", "vocals", "guitar", "piano"]
 
@@ -540,63 +572,32 @@ def separate_stems(
     device: str = "cpu",
     model: str = "htdemucs_6s",
     verbose: bool = False,
-    segment: int = 7,
 ) -> dict[str, pathlib.Path]:
-    """Demucs で 6-stem 分離を実行し、stem名→WAVパスの辞書を返す.
-
-    subprocess 経由ではなく Python API を直接呼び出す。
-    segment を小さくすることで torchaudio 2.8 のパディング AssertionError を回避する。
-    """
-    import torch
-    import torchaudio
-    from demucs.pretrained import get_model
-    from demucs.apply import apply_model
-
+    """Demucs で 6-stem 分離を実行し、stem名→WAVパスの辞書を返す."""
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    wav_path = pathlib.Path(wav_path)
 
-    if not verbose:
-        warnings.filterwarnings("ignore")
+    sink = None if verbose else subprocess.DEVNULL
+    subprocess.run(
+        [
+            "python", "-m", "demucs",
+            "-n", model,
+            "-d", device,
+            "-o", str(output_dir),
+            str(wav_path),
+        ],
+        check=True,
+        stdout=sink,
+        stderr=sink,
+    )
 
-    # モデルロード
-    demucs_model = get_model(model)
-    demucs_model.eval()
-    if device != "cpu":
-        demucs_model.to(device)
-
-    # 音声ロード → モデルのサンプルレートにリサンプル
-    waveform, sr = torchaudio.load(str(wav_path))
-    if sr != demucs_model.samplerate:
-        waveform = torchaudio.functional.resample(waveform, sr, demucs_model.samplerate)
-
-    # モノラル → ステレオ
-    if waveform.shape[0] == 1:
-        waveform = waveform.repeat(2, 1)
-
-    # 推論
-    with torch.no_grad():
-        sources = apply_model(
-            demucs_model,
-            waveform[None],          # (1, 2, T)
-            device=device,
-            segment=segment,         # chunk サイズ（秒）。小さくするとVRAM節約・padding回避
-            overlap=0.25,
-            progress=verbose,
-        )
-    sources = sources[0]             # (n_stems, 2, T)
-
-    # stem ごとに WAV 保存
-    stem_dir = output_dir / model / wav_path.stem
-    stem_dir.mkdir(parents=True, exist_ok=True)
+    # demucs の出力: output_dir/model/track_stem/{stem}.wav
+    stem_dir = output_dir / model / pathlib.Path(wav_path).stem
     stems: dict[str, pathlib.Path] = {}
-
-    for i, stem_name in enumerate(demucs_model.sources):
-        if stem_name not in STEMS_6:
-            continue
-        out_path = stem_dir / f"{stem_name}.wav"
-        torchaudio.save(str(out_path), sources[i].cpu(), demucs_model.samplerate)
-        stems[stem_name] = out_path
+    for stem_name in STEMS_6:
+        p = stem_dir / f"{stem_name}.wav"
+        if p.exists():
+            stems[stem_name] = p
 
     return stems
 #+END_SRC
@@ -1632,8 +1633,8 @@ def load_meta(yaml_path: pathlib.Path) -> SunoMeta:
 
 def ingest(
     source: str,
-    title: Optional[str],
-    lyrics_text: Optional[str],
+    title: str,
+    lyrics_text: str,
     output_dir: pathlib.Path,
     style_tags: str = "",
     prompt: Optional[str] = None,
@@ -1642,8 +1643,7 @@ def ingest(
     """Suno音源を取り込み、(WAVパス, SunoMeta) を返す.
 
     BPMとキーは音声から自動解析する（手動指定不要）。
-    URLが渡された場合、title・lyrics・style・promptをページから自動取得する。
-    自動取得できない場合は引数の値を使う。title未指定時はsuno_idを代用する。
+    スタイルタグはURLがある場合にページから自動取得を試みる。
     """
     import datetime
 
@@ -1657,10 +1657,6 @@ def ingest(
 
     if source.startswith("http"):
         page_meta = fetch_suno_page_meta(source)
-        if not title and page_meta.get("title"):
-            title = page_meta["title"]
-        if not lyrics_text and page_meta.get("lyrics"):
-            lyrics_text = page_meta["lyrics"]
         if not style_tags and page_meta.get("style"):
             style_tags = page_meta["style"]
         if prompt is None:
@@ -1672,12 +1668,6 @@ def ingest(
         if not mp3_path.exists():
             raise FileNotFoundError(f"入力ファイルが見つかりません: {mp3_path}")
         suno_url = None
-
-    # フォールバック
-    if not title:
-        title = suno_id
-    if not lyrics_text:
-        lyrics_text = ""
 
     from retranscribe.preprocess import to_wav
     wav_path = to_wav(mp3_path, output_dir)
@@ -2063,7 +2053,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 app = typer.Typer(name="retranscribe-suno", help="Suno AI音源の採譜・管理")
 console = Console()
@@ -2073,10 +2063,9 @@ console = Console()
 def ingest_and_transcribe(
     source: str = typer.Option(..., "--source", "-s",
         help="SunoのURL、またはローカルMP3/WAVファイルパス"),
-    title: Optional[str] = typer.Option(None, "--title", "-t",
-        help="曲タイトル（URLの場合は自動取得。省略可）"),
-    lyrics: Optional[pathlib.Path] = typer.Option(None, "--lyrics", "-l",
-        help="歌詞テキストファイル（.txt）（URLの場合は自動取得。省略可）"),
+    title: str = typer.Option(..., "--title", "-t", help="曲タイトル"),
+    lyrics: pathlib.Path = typer.Option(..., "--lyrics", "-l",
+        help="Sunoの歌詞テキストファイル（.txt）"),
     output_dir: Optional[pathlib.Path] = typer.Option(None, "--output", "-o",
         help="出力ディレクトリ（省略時は ./suno_output/<title>）"),
     org_library: Optional[pathlib.Path] = typer.Option(None, "--org-library",
@@ -2093,70 +2082,37 @@ def ingest_and_transcribe(
         help="MuseScore CLIコマンド"),
     hugo: bool = typer.Option(False, "--hugo",
         help="Hugoフロントマター付きMarkdownを生成する"),
-    verbose: bool = typer.Option(False, "--verbose", "-v",
-        help="外部ツール（Demucs等）のログを表示する"),
 ) -> None:
-    """Suno音源を採譜してMIDI/MusicXML/Orgライブラリに追加する.
+    """Suno音源を採譜してMIDI/MusicXML/Orgライブラリに追加する."""
 
-    URLを指定した場合、タイトル・歌詞・スタイルはページから自動取得を試みる。
-    ローカルファイルの場合は --title と --lyrics の指定を推奨する。
-    """
-    import warnings
-    if not verbose:
-        warnings.filterwarnings("ignore")
+    safe_title = title.replace("/", "_").replace(" ", "_")
+    if output_dir is None:
+        output_dir = pathlib.Path("suno_output") / safe_title
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 歌詞ファイルが指定されている場合のみ読み込む
-    lyrics_text: Optional[str] = None
-    if lyrics is not None:
-        if not lyrics.exists():
-            console.print(f"[red]歌詞ファイルが見つかりません: {lyrics}[/red]")
-            raise typer.Exit(1)
-        lyrics_text = lyrics.read_text(encoding="utf-8")
-
-    # output_dir は ingest() 後に title が確定してから決定する
-    _output_dir = output_dir
+    if not lyrics.exists():
+        console.print(f"[red]歌詞ファイルが見つかりません: {lyrics}[/red]")
+        raise typer.Exit(1)
+    lyrics_text = lyrics.read_text(encoding="utf-8")
 
     steps = 8
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description:<40}"),
-        BarColumn(bar_width=24),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        redirect_stdout=not verbose,
-        redirect_stderr=not verbose,
-        transient=False,
-    ) as progress:
-        task = progress.add_task("開始...", total=steps)
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                  BarColumn(), TimeElapsedColumn(), console=console) as progress:
+        task = progress.add_task("開始...", total=steps, elapsed="")
 
-        # 1. Suno取り込み（title/lyrics/style自動取得 + BPM・Key自動解析）
+        # 1. Suno取り込み（BPM・Key自動解析含む）
         progress.update(task, description="[cyan]Suno取り込み[/cyan] (ingest + BPM/Key解析) ...")
-        from retranscribe.suno.ingest import ingest, extract_suno_id
-        # output_dir が未指定の場合は仮ディレクトリで ingest し、title 確定後に移動
-        _suno_id = extract_suno_id(source)
-        _tmp_dir = _output_dir or pathlib.Path("suno_output") / _suno_id
+        from retranscribe.suno.ingest import ingest
         wav_path, meta = ingest(
             source=source, title=title, lyrics_text=lyrics_text,
-            output_dir=_tmp_dir, style_tags=style, prompt=prompt,
+            output_dir=output_dir, style_tags=style, prompt=prompt,
         )
-        # title が自動取得された場合、output_dir を確定
-        if _output_dir is None:
-            safe_title = meta.title.replace("/", "_").replace(" ", "_")
-            output_dir = pathlib.Path("suno_output") / safe_title
-            if _tmp_dir != output_dir:
-                import shutil
-                shutil.move(str(_tmp_dir), str(output_dir))
-                wav_path = output_dir / wav_path.relative_to(_tmp_dir)
-        else:
-            output_dir = _output_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
         progress.advance(task)
 
         # 2. Stem分離
         progress.update(task, description="[cyan]Stem分離[/cyan] (Demucs 6s) ...")
         from retranscribe.stems.demucs6s import separate_stems
-        stems = separate_stems(wav_path, output_dir / "stems", device=device, verbose=verbose)
+        stems = separate_stems(wav_path, output_dir / "stems", device=device)
         progress.advance(task)
 
         # 3. ビート追跡（BPM/Keyはingest()内で推定済み。ここではbeat位置を取得）

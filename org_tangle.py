@@ -7,7 +7,7 @@ org-babel-tangle と同等のロジックで README.org から全ソースファ
 - #+BEGIN_SRC lang :tangle <path>  — ブロックレベルの tangle 指定
 - :PROPERTIES: / :header-args:lang: :tangle <path>  — セクションレベルのデフォルト
 - :tangle no  — スキップ
-- #+PROPERTY: header-args :mkdirp yes  — ファイルレベルのデフォルト
+- #+PROPERTY: header-args [:mkdirp yes  — ファイルレベルのデフォルト
 - 同一ファイルへの複数ブロック追記（org-babel と同じ動作）
 - noweb 参照は未対応（retranscribe には不要）
 
@@ -24,6 +24,7 @@ import argparse
 import os
 import re
 import sys
+import textwrap  # ← 追加
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -227,8 +228,9 @@ def write_files(
             for i, blk in enumerate(blks):
                 if i > 0:
                     f.write("\n")
-                f.write(blk.content)
-                if blk.content and not blk.content.endswith("\n"):
+                content = textwrap.dedent(blk.content)  # ← 変更: インデント除去
+                f.write(content)
+                if content and not content.endswith("\n"):  # ← 変更: content を参照
                     f.write("\n")
 
     return result
