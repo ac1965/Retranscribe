@@ -1,3 +1,0 @@
-[console_scripts]
-retranscribe = retranscribe.cli:app
-retranscribe-suno = retranscribe.suno.cli_suno:app
