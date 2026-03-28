@@ -173,80 +173,80 @@ retranscribe/
 :END:
 
 #+BEGIN_SRC toml :tangle pyproject.toml
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+  [build-system]
+  requires = ["hatchling"]
+  build-backend = "hatchling.build"
 
-[project]
-name = "retranscribe"
-version = "0.2.0"
-description = "Multi-hypothesis audio transcription with resynth rescoring"
-requires-python = ">=3.10"
+  [project]
+  name = "retranscribe"
+  version = "0.2.0"
+  description = "Multi-hypothesis audio transcription with resynth rescoring"
+  requires-python = ">=3.10,<3.13"
 
-dependencies = [
-    # stem separation
-    "demucs>=4.0.0",
-    # beat tracking
-    "madmom>=0.16.1",
-    "librosa>=0.10.0",
-    # ASR / lyrics alignment
-    "whisperx>=3.7.4",
-    # note detection
-    "basic-pitch>=0.4.0",
-    "torchcrepe>=0.0.24",
-    # chord estimation / signal processing
-    "numpy>=1.24.0",
-    "scipy>=1.10.0",
-    "soundfile>=0.12.0",
-    "mir-eval>=0.7.0",
-    # export
-    "music21>=9.1.0",
-    "pretty-midi>=0.2.10",
-    # torch: torchaudio LazyModule 問題を避けるため 2.7 系に固定
-    "torch==2.7.*",
-    "torchaudio==2.7.*",
-    # runtime: madmom / basic-pitch が pkg_resources を実行時に要求する
-    "setuptools>=68,<81",
-    # suno サブシステム
-    "pyyaml>=6.0",
-    "requests>=2.31.0",
-    "yt-dlp>=2024.1.0",
-    # CLI
-    "typer>=0.9.0",
-    "rich>=13.0.0",
-    "pathlib2>=2.3.7",
-]
+  dependencies = [
+      # stem separation
+      "demucs>=4.0.0",
+      # beat tracking
+      "madmom>=0.16.1",
+      "librosa>=0.10.0",
+      # ASR / lyrics alignment
+      "whisperx>=3.8.4",
+      # note detection
+      "basic-pitch>=0.4.0",
+      "torchcrepe>=0.0.24",
+      # chord estimation / signal processing
+      "numpy>=1.24.0",
+      "scipy>=1.10.0",
+      "soundfile>=0.12.0",
+      "mir-eval>=0.7.0",
+      # export
+      "music21>=9.1.0",
+      "pretty-midi>=0.2.10",
+      # torch: torchaudio LazyModule 問題を避けるため 2.7 系に固定
+      "torch==2.8.*",
+      "torchaudio==2.8.*",
+      # runtime: madmom / basic-pitch が pkg_resources を実行時に要求する
+      "setuptools>=68,<81",
+      # suno サブシステム
+      "pyyaml>=6.0",
+      "requests>=2.31.0",
+      "yt-dlp>=2024.1.0",
+      # CLI
+      "typer>=0.9.0",
+      "rich>=13.0.0",
+      "pathlib2>=2.3.7",
+  ]
 
-[project.readme]
-file = "README.org"
-content-type = "text/plain"
+  [project.readme]
+  file = "README.org"
+  content-type = "text/plain"
 
-[project.optional-dependencies]
-piano = []  # magenta は pip install magenta で別途手動インストール
-dev = [
-    "pytest>=7.0",
-    "ruff>=0.1.0",
-]
+  [project.optional-dependencies]
+  piano = []  # magenta は pip install magenta で別途手動インストール
+  dev = [
+      "pytest>=7.0",
+      "ruff>=0.1.0",
+  ]
 
-[project.scripts]
-retranscribe      = "retranscribe.cli:app"
-retranscribe-suno = "retranscribe.suno.cli_suno:app"
+  [project.scripts]
+  retranscribe      = "retranscribe.cli:app"
+  retranscribe-suno = "retranscribe.suno.cli_suno:app"
 
-[tool.hatch.build.targets.wheel]
-packages = ["retranscribe"]
+  [tool.hatch.build.targets.wheel]
+  packages = ["retranscribe"]
 
-[tool.uv]
-override-dependencies = [
-    "tensorflow-macos; python_version < '3.0'",
-    "tensorflow; python_version < '3.0'",
-]
+  [tool.uv]
+  override-dependencies = [
+      "tensorflow-macos; python_version < '3.0'",
+      "tensorflow; python_version < '3.0'",
+  ]
 
-[tool.uv.extra-build-dependencies]
-madmom = ["Cython", "numpy", "setuptools"]
+  [tool.uv.extra-build-dependencies]
+  madmom = ["Cython", "numpy", "setuptools"]
 
-[tool.ruff]
-line-length = 100
-target-version = "py310"
+  [tool.ruff]
+  line-length = 100
+  target-version = "py310"
 #+END_SRC
 
 ** 依存関係の選定理由
