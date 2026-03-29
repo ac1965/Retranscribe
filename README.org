@@ -1409,6 +1409,10 @@ class SunoMeta:
     def from_yaml_dict(cls, d: dict) -> "SunoMeta":
         return cls(**d)
 
+    def update_lyrics(self, text: str) -> None:
+        """WhisperX 書き起こし結果で lyrics_raw を上書きする."""
+        self.lyrics_raw = text
+
 
 # ---------------------------------------------------------------------------
 # Sunoページからのメタデータ自動取得
@@ -1862,6 +1866,64 @@ def align_suno_lyrics(
     )
     result["language"] = language
     return result
+
+
+def transcribe_vocals(
+    vocals_wav: pathlib.Path,
+    device: str = "cpu",
+    language: Optional[str] = None,
+) -> dict:
+    """歌詞テキスト未指定時のフォールバック: WhisperX 自由 ASR.
+
+    歌詞ファイルが渡されなかった場合（ローカル MP3 指定かつ --lyrics 省略）に
+    align_suno_lyrics の代わりに呼ばれる。
+
+    Returns:
+        whisperx の align() 戻り値と同形の dict。
+        "transcribed_text" キーに結合テキストを追加する。
+    """
+    try:
+        import whisperx
+    except ImportError as exc:
+        raise ImportError("whisperxが必要です: `uv add whisperx`") from exc
+
+    audio = whisperx.load_audio(str(vocals_wav))
+    model = whisperx.load_model("base", device=device, compute_type="int8")
+    result = model.transcribe(audio, batch_size=16)
+    del model
+
+    if language is None:
+        language = result.get("language", "ja")
+
+    align_model, metadata = whisperx.load_align_model(
+        language_code=language, device=device
+    )
+    aligned = whisperx.align(
+        result["segments"], align_model, metadata,
+        audio, device=device, return_char_alignments=False,
+    )
+    aligned["language"] = language
+
+    # セグメントテキストを結合して保持（meta.lyrics_raw への書き戻し用）
+    aligned["transcribed_text"] = "\n".join(
+        seg.get("text", "").strip()
+        for seg in aligned.get("segments", [])
+    )
+    return aligned
+
+
+def save_transcription(
+    aligned: dict,
+    output_dir: pathlib.Path,
+    stem: str = "transcribed_lyrics",
+) -> pathlib.Path:
+    """WhisperX の書き起こし結果をテキストファイルに保存する."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    txt_path = output_dir / f"{stem}.txt"
+    txt_path.write_text(
+        aligned.get("transcribed_text", ""), encoding="utf-8"
+    )
+    return txt_path
 #+END_SRC
 
 ** suno/export.py — MIDI/MusicXML/Org 出力
@@ -2177,8 +2239,26 @@ def ingest_and_transcribe(
         progress.update(task, description="[cyan]歌詞アライン[/cyan] (WhisperX) ...")
         lyrics_info = None
         if "vocals" in stems:
-            from retranscribe.suno.lyrics_align import align_suno_lyrics
-            lyrics_info = align_suno_lyrics(stems["vocals"], meta.lyrics_raw, device=device)
+            if meta.lyrics_raw:
+                # 歌詞テキストあり（--lyrics 指定 or URL スクレイピング成功）→ 強制アライン
+                from retranscribe.suno.lyrics_align import align_suno_lyrics
+                lyrics_info = align_suno_lyrics(
+                    stems["vocals"], meta.lyrics_raw, device=device
+                )
+            else:
+                # 歌詞テキストなし（ローカル MP3 かつ --lyrics 未指定）→ 自由 ASR
+                from retranscribe.suno.lyrics_align import (
+                    transcribe_vocals,
+                    save_transcription,
+                )
+                lyrics_info = transcribe_vocals(stems["vocals"], device=device)
+                txt_path = save_transcription(lyrics_info, output_dir)
+                meta.update_lyrics(lyrics_info.get("transcribed_text", ""))
+                console.print(
+                    f"  [dim]歌詞テキスト未指定: WhisperX 書き起こし結果を保存しました"
+                    f" → {txt_path}[/dim]\n"
+                    f"  [dim]次回は --lyrics {txt_path} を指定すると強制アラインで精度が向上します[/dim]"
+                )
         progress.advance(task)
 
         # 6. 多仮説生成
