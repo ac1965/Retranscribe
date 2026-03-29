@@ -65,6 +65,20 @@ uv run retranscribe-suno \
   --lyrics ~/Downloads/lyrics.txt \
   --style "j-pop, lo-fi, 8bit" \
   --output ~/Music/suno/8ビットの夜風
+
+# gcui-art/suno-api 経由でメタデータ・音源を完全補完
+# (suno-api サーバーを SUNO_COOKIE 付きで起動済みの場合)
+uv run retranscribe-suno \
+  --suno-id "abc-123-uuid" \
+  --suno-api-url "http://localhost:3000" \
+  --org-library ~/Music/suno_library.org
+
+# ローカル MP3 + suno-api でメタデータのみ補完 (--source と --suno-id 併用)
+uv run retranscribe-suno \
+  --source ~/Downloads/8ビットの夜風.mp3 \
+  --suno-id "abc-123-uuid" \
+  --suno-api-url "http://localhost:3000" \
+  --output ~/Music/suno/8ビットの夜風
 #+END_SRC
 
 * 設計思想
@@ -1360,6 +1374,8 @@ BPM と Key は音声から確実に取得できるため手動指定不要。
 
 URL が渡された場合は =__NEXT_DATA__= スクレイピングでスタイルタグを自動取得し、
 yt-dlp で MP3 をダウンロードする。BPM と Key は WAV 変換後に音声解析で自動推定する。
+=fetch_sunoapi_meta()= を使うと gcui-art/suno-api の =/api/clip= エンドポイントから
+title・lyrics・style・audio_url を補完できる（セルフホスト環境が必要）。
 
 #+BEGIN_SRC python :tangle retranscribe/suno/ingest.py
 """Suno音源の取り込みモジュール.
@@ -1367,6 +1383,7 @@ yt-dlp で MP3 をダウンロードする。BPM と Key は WAV 変換後に音
 機能:
 - Suno URLからyt-dlpでMP3取得（オプション）
 - SunoページHTMLから__NEXT_DATA__経由でスタイルタグ自動取得
+- gcui-art/suno-api の /api/clip エンドポイントからメタデータ補完
 - ローカルMP3ファイルの受け取り
 - 歌詞テキストの受け取りとYAML保存
 - SunoメタデータのDataclass化
@@ -1492,6 +1509,60 @@ def fetch_suno_page_meta(url: str) -> dict:
     prompt = clip.get("prompt") or meta_block.get("gpt_description_prompt") or ""
     if prompt and prompt != lyrics:
         result["prompt"] = prompt
+
+    return result
+
+
+def fetch_sunoapi_meta(suno_id: str, base_url: str) -> dict:
+    """gcui-art/suno-api の /api/clip エンドポイントからメタデータを取得する.
+
+    Args:
+        suno_id: SunoのクリップID（UUIDまたは短縮形）。
+        base_url: suno-api サーバーのベースURL（例: "http://localhost:3000"）。
+                  末尾スラッシュは不要。
+
+    Returns:
+        取得できたフィールドのみ含むdict。失敗時は空dict。
+        キー: "title", "lyrics", "style", "prompt", "audio_url"
+
+    Note:
+        gcui-art/suno-api はセルフホスト型の非公式ラッパーであり、
+        SUNO_COOKIE を設定してユーザー自身が立ち上げたサーバーが必要。
+        レスポンスの歌詞フィールドは "lyric"（単数形）であることに注意。
+    """
+    try:
+        import requests as _requests
+    except ImportError:
+        return {}
+
+    url = f"{base_url.rstrip('/')}/api/clip"
+    try:
+        resp = _requests.get(url, params={"id": suno_id}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return {}
+
+    # /api/clip は単一オブジェクト、/api/get は配列の場合があるため両方に対応
+    if isinstance(data, list):
+        data = data[0] if data else {}
+
+    result: dict = {}
+    if data.get("title"):
+        result["title"] = data["title"]
+    # 歌詞フィールドは "lyric"（単数）または "lyrics"（複数）が混在する
+    lyric = data.get("lyric") or data.get("lyrics") or ""
+    if lyric:
+        result["lyrics"] = lyric
+    tags = data.get("tags") or data.get("style") or ""
+    if tags:
+        result["style"] = tags
+    prompt = data.get("prompt") or ""
+    if prompt and prompt != lyric:
+        result["prompt"] = prompt
+    audio_url = data.get("audio_url") or ""
+    if audio_url and data.get("status") == "complete":
+        result["audio_url"] = audio_url
 
     return result
 
@@ -2133,8 +2204,12 @@ console = Console()
 
 @app.command()
 def ingest_and_transcribe(
-    source: str = typer.Option(..., "--source", "-s",
-        help="SunoのURL、またはローカルMP3/WAVファイルパス"),
+    source: Optional[str] = typer.Option(None, "--source", "-s",
+        help="SunoのURL、またはローカルMP3/WAVファイルパス。--suno-id 指定時は省略可"),
+    suno_id: Optional[str] = typer.Option(None, "--suno-id",
+        help="SunoのクリップID（UUID）。--source 未指定時に suno-api でメタデータ・音源を補完する"),
+    suno_api_url: str = typer.Option("http://localhost:3000", "--suno-api-url",
+        help="gcui-art/suno-api サーバーのベースURL（SUNO_COOKIE 設定済みのセルフホスト環境）"),
     title: Optional[str] = typer.Option(None, "--title", "-t",
         help="曲タイトル（URLの場合は自動取得。省略可）"),
     lyrics: Optional[pathlib.Path] = typer.Option(None, "--lyrics", "-l",
@@ -2160,12 +2235,20 @@ def ingest_and_transcribe(
 ) -> None:
     """Suno音源を採譜してMIDI/MusicXML/Orgライブラリに追加する.
 
-    URLを指定した場合、タイトル・歌詞・スタイルはページから自動取得を試みる。
-    ローカルファイルの場合は --title と --lyrics の指定を推奨する。
+    --source にURLまたはローカルMP3を指定する。
+    --suno-id のみ指定した場合は gcui-art/suno-api 経由でメタデータ・音源URLを補完し、
+    yt-dlp でダウンロードする（suno-api サーバーが SUNO_COOKIE 付きで起動済みであること）。
+    --source と --suno-id を同時指定した場合は --source を音源として使い、
+    メタデータのみ suno-api で補完する。
     """
     import warnings
     if not verbose:
         warnings.filterwarnings("ignore")
+
+    # --source / --suno-id の両方未指定はエラー
+    if not source and not suno_id:
+        console.print("[red]--source または --suno-id のいずれかを指定してください。[/red]")
+        raise typer.Exit(1)
 
     # 歌詞ファイルが指定されている場合のみ読み込む
     lyrics_text: Optional[str] = None
@@ -2174,6 +2257,48 @@ def ingest_and_transcribe(
             console.print(f"[red]歌詞ファイルが見つかりません: {lyrics}[/red]")
             raise typer.Exit(1)
         lyrics_text = lyrics.read_text(encoding="utf-8")
+
+    # ---------------------------------------------------------------------------
+    # suno-api によるメタデータ・音源URL補完
+    # --suno-id が指定された場合、gcui-art/suno-api の /api/clip で補完を試みる。
+    # --source 未指定かつ audio_url が取得できた場合は audio_url を source に充てる。
+    # --source 指定済みの場合はメタデータのみ補完する。
+    # ---------------------------------------------------------------------------
+    _resolved_suno_id = suno_id
+    if suno_id:
+        console.print(f"  [dim]suno-api ({suno_api_url}) でメタデータを補完中...[/dim]")
+        from retranscribe.suno.ingest import fetch_sunoapi_meta
+        api_meta = fetch_sunoapi_meta(suno_id, suno_api_url)
+
+        if api_meta:
+            if not title and api_meta.get("title"):
+                title = api_meta["title"]
+                console.print(f"  [dim]title 補完: {title}[/dim]")
+            if not lyrics_text and api_meta.get("lyrics"):
+                lyrics_text = api_meta["lyrics"]
+                console.print("  [dim]lyrics 補完: suno-api から取得[/dim]")
+            if not style and api_meta.get("style"):
+                style = api_meta["style"]
+                console.print(f"  [dim]style 補完: {style}[/dim]")
+            if prompt is None and api_meta.get("prompt"):
+                prompt = api_meta["prompt"]
+            if not source and api_meta.get("audio_url"):
+                source = api_meta["audio_url"]
+                console.print(f"  [dim]source 補完: audio_url を使用 → {source}[/dim]")
+        else:
+            console.print(
+                f"  [yellow]suno-api からメタデータを取得できませんでした"
+                f" (url={suno_api_url}, id={suno_id})。"
+                f" SUNO_COOKIE 設定とサーバー稼働を確認してください。[/yellow]"
+            )
+
+    # suno-api 補完後も source が未解決の場合はエラー
+    if not source:
+        console.print(
+            "[red]音源が解決できませんでした。--source でMP3/WAVを指定するか、"
+            "suno-api で audio_url を取得できる状態にしてください。[/red]"
+        )
+        raise typer.Exit(1)
 
     # output_dir は ingest() 後に title が確定してから決定する
     _output_dir = output_dir
@@ -2310,6 +2435,10 @@ if __name__ == "__main__":
 ** 既知の制限事項
 
 - Suno の =__NEXT_DATA__= スクレイピングはページ構造変更で無効化される可能性がある
+- =gcui-art/suno-api= 連携は非公式ラッパーであり、ユーザー自身が SUNO_COOKIE を設定して
+  サーバーを立ち上げる必要がある。Suno の利用規約の範囲内で使用すること
+- =fetch_sunoapi_meta()= の歌詞フィールドは ="/lyric"= （単数形）と ="/lyrics"= （複数形）が
+  suno-api のバージョンにより混在する可能性があるため、両方を参照している
 - magenta（Onsets and Frames）は pip install magenta で別途手動インストールが必要
 - torchaudio は 2.7 系に固定（LazyModule resample エラー回避のため）
 - madmom は build 時に Cython と numpy が必要（=uv.extra-build-dependencies= で対処済み）
