@@ -14,6 +14,8 @@
 
 #+BEGIN_SRC bash :tangle no
 # 1. ソース生成（tangle が先、uv sync が後）
+#    org_tangle.py はリポジトリに README.org と並べてコミット済み。
+#    標準ライブラリのみで動作するため uv sync 前でも実行可能。
 python3 org_tangle.py README.org
 
 # 2. 依存パッケージのインストール
@@ -76,6 +78,46 @@ uv run retranscribe ./input/song.flac --no-pdf
     --suno-api-url "http://localhost:4000" \
     --org-library ~/Music/suno_library.org
 #+END_SRC
+
+** ライブラリ一括取得 → バッチ採譜ワークフロー
+
+#+BEGIN_SRC bash :tangle no
+  # 0. アカウント設定（初回のみ）
+  #    accounts.json.example を参考にして accounts.json を作成する
+  cp accounts.json.example accounts.json
+  python retranscribe/suno/accounts.py add --id ac1965 --url http://localhost:3000
+
+  # 1. 全アカウントの疎通確認
+  python retranscribe/suno/accounts.py ping
+
+  # 2. suno-api ライブラリを JSON に一括取得
+  #    出力: ./libraries/suno_library_ac1965.json 等
+  python retranscribe/suno/library_fetch.py \
+    --accounts-file accounts.json \
+    --output-dir ./libraries \
+    --no-raw
+
+  # 3. 取得した JSON を retranscribe-suno に渡してバッチ採譜
+  #    --library-json を指定すると songs[] を順に採譜し org-library に追記する
+  uv run retranscribe-suno \
+    --library-json ./libraries/suno_library_ac1965.json \
+    --suno-api-url http://localhost:3000 \
+    --org-library ~/Music/suno_library.org \
+    --no-pdf
+
+  # 4. 単一 suno-api インスタンス（accounts.json なし）
+  python retranscribe/suno/library_fetch.py \
+    --base-url http://localhost:3000 \
+    --account-id ac1965 \
+    --output ./libraries/suno_library_ac1965.json
+#+END_SRC
+
+#+BEGIN_QUOTE
+*連携フロー*: =library_fetch.py= が出力する JSON の =songs[]= 配列を
+=retranscribe-suno --library-json= が読み込み、各エントリの =audio_url= と
+メタデータ（=title=, =lyric=, =tags=）を =ingest()= に直接渡すことで、
+suno-api への再クエリを省略して採譜パイプラインを実行する。
+#+END_QUOTE
 
 * 設計思想
 :PROPERTIES:
@@ -179,6 +221,8 @@ Basic Pitch の公式ドキュメントは、*一度に一楽器* を入力し�
 retranscribe/
 ├── pyproject.toml
 ├── README.org                  ← このファイル（tangle source）
+├── org_tangle.py               ← tangle 実行スクリプト（Emacs 不要・tangle 対象外）
+├── accounts.json.example       ← suno-api インスタンス設定サンプル
 └── retranscribe/
     ├── __init__.py
     ├── cli.py                  ← analyze サブコマンド
@@ -200,7 +244,9 @@ retranscribe/
         ├── pitch_fix.py
         ├── lyrics_align.py
         ├── export.py
-        └── cli_suno.py         ← retranscribe-suno エントリポイント
+        ├── cli_suno.py         ← retranscribe-suno エントリポイント
+        ├── library_fetch.py    ← suno-api ライブラリ一括取得スクリプト
+        └── accounts.py         ← accounts.json CLI 管理ツール
 #+END_SRC
 
 * インストールと設定
@@ -314,17 +360,374 @@ target-version = "py310"
 このファイルを =org-babel-tangle= することで全ソースが生成される。
 あるいは =org_tangle.py= を使って Emacs なしで展開できる。
 
+=org_tangle.py= は *tangle によって生成されるファイルではなく*、
+tangle を実行するためのブートストラップスクリプトである。
+リポジトリに =README.org= と並べて直接コミットする。
+
+#+BEGIN_QUOTE
+*起動順序の制約*: =org_tangle.py= は標準ライブラリのみで動作するため
+=uv sync= 前でも実行できる。必ず =tangle → uv sync= の順を守ること。
+#+END_QUOTE
+
+*** Emacs で tangle する場合
+
 #+BEGIN_SRC emacs-lisp :tangle no
 ;; M-x org-babel-tangle  または  C-c C-v t
 ;; .dir-locals.el に置くと保存時に自動 tangle:
 ((org-mode . ((eval . (add-hook 'after-save-hook #'org-babel-tangle nil t)))))
 #+END_SRC
 
+*** org_tangle.py で tangle する場合（Emacs 不要）
+
 #+BEGIN_SRC bash :tangle no
-# Emacs なしで tangle する場合
-python org_tangle.py README.org
-python org_tangle.py README.org --dry-run   # 確認のみ
-python org_tangle.py README.org --file retranscribe/suno/ingest.py  # 1ファイルだけ
+python org_tangle.py README.org                                        # 全ファイル生成
+python org_tangle.py README.org --dry-run                             # 確認のみ（ファイル書き出しなし）
+python org_tangle.py README.org --file retranscribe/suno/ingest.py   # 1ファイルだけ再生成
+python org_tangle.py README.org --lang python                         # Python ブロックのみ
+python org_tangle.py README.org --verbose                             # 出力ファイルサイズも表示
+#+END_SRC
+
+*** org_tangle.py — ソース
+
+org-babel-tangle と同等のロジックを Python 標準ライブラリのみで実装したブートストラップ。
+=:tangle no= ブロックとして収録しており、このファイル自体は tangle 生成物ではない。
+
+対応機能:
+- =#+BEGIN_SRC lang :tangle <path>= — ブロックレベルの tangle 指定
+- =:header-args:lang: :tangle <path>= — セクションレベルのデフォルト（=:PROPERTIES:= 内）
+- =#+PROPERTY: header-args[:lang] :tangle <path>= — ファイルレベルのデフォルト
+- =:tangle no= — スキップ
+- 同一ファイルへの複数ブロック追記（org-babel と同じ動作）
+- =textwrap.dedent= によるインデント除去
+- noweb 参照は未対応（retranscribe には不要）
+
+#+BEGIN_SRC python :tangle no
+#!/usr/bin/env python3
+"""org_tangle.py — Org-babel tangle を Python で再実装する.
+
+org-babel-tangle と同等のロジックで README.org から全ソースファイルを生成する。
+
+対応する Org-babel 機能:
+- #+BEGIN_SRC lang :tangle <path>  — ブロックレベルの tangle 指定
+- :PROPERTIES: / :header-args:lang: :tangle <path>  — セクションレベルのデフォルト
+- :tangle no  — スキップ
+- #+PROPERTY: header-args [:mkdirp yes  — ファイルレベルのデフォルト
+- 同一ファイルへの複数ブロック追記（org-babel と同じ動作）
+- noweb 参照は未対応（retranscribe には不要）
+
+使い方:
+    python org_tangle.py                     # カレントの README.org を処理
+    python org_tangle.py README.org          # ファイル指定
+    python org_tangle.py README.org --dry-run  # ファイル一覧のみ表示
+    python org_tangle.py README.org --out /tmp/out  # 出力先を指定
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import textwrap
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# データ構造
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Block:
+    """1つの #+BEGIN_SRC ブロック."""
+    tangle: str           # 出力ファイルパス
+    lang: str             # 言語識別子
+    content: str          # ブロック本文
+    src_line: int         # 元ファイルの行番号（デバッグ用）
+
+
+# ---------------------------------------------------------------------------
+# パーサー
+# ---------------------------------------------------------------------------
+
+# #+BEGIN_SRC lang ... :tangle <path> ...
+_BEGIN_SRC_RE = re.compile(
+    r"^\s*#\+BEGIN_SRC\s+(\S+)(.*)?$", re.IGNORECASE
+)
+_END_SRC_RE = re.compile(r"^\s*#\+END_SRC\s*$", re.IGNORECASE)
+
+# セクション :PROPERTIES: 内の :header-args:lang: :tangle <path>
+# 例: :header-args:python: :tangle retranscribe/foo.py
+# 例: :header-args: :tangle retranscribe/foo.py  (言語非限定)
+_HEADER_ARGS_RE = re.compile(
+    r"^\s*:header-args(?::(\S+))?:\s+(.+)$", re.IGNORECASE
+)
+
+# ファイルレベル #+PROPERTY: header-args[:lang] :tangle <path>
+_PROPERTY_RE = re.compile(
+    r"^\s*#\+PROPERTY:\s+header-args(?::(\S+))?\s+(.+)$", re.IGNORECASE
+)
+
+def _extract_tangle(header_rest: str) -> Optional[str]:
+    """ヘッダー文字列から :tangle <value> を抽出する."""
+    m = re.search(r":tangle\s+(\S+)", header_rest)
+    if m:
+        v = m.group(1)
+        return None if v.lower() == "no" else v
+    return None  # :tangle 指定なし → None（継承）
+
+
+def parse_org(text: str) -> list[Block]:
+    """Org テキストを走査して tangle 対象ブロックのリストを返す."""
+
+    lines = text.splitlines()
+    blocks: list[Block] = []
+
+    # ファイルレベルのデフォルト tangle: lang -> Optional[str]
+    file_defaults: dict[str, Optional[str]] = {}
+
+    # セクションスタック: 見出しレベルごとの (lang -> Optional[str])
+    # level 0 = ルート
+    section_stack: list[dict[str, Optional[str]]] = [{}]
+    current_level = 0
+
+    in_properties = False
+    in_src = False
+    src_lang = ""
+    src_tangle: Optional[str] = None
+    src_lines: list[str] = []
+    src_start_line = 0
+
+    for lineno, line in enumerate(lines, 1):
+
+        # ── ファイルレベル PROPERTY ──────────────────────────────────────
+        if not in_src:
+            m = _PROPERTY_RE.match(line)
+            if m:
+                lang_key = (m.group(1) or "").lower()  # "" = 全言語
+                tangle_val = _extract_tangle(m.group(2))
+                file_defaults[lang_key] = tangle_val
+                continue
+
+        # ── 見出し ───────────────────────────────────────────────────────
+        if not in_src:
+            h = re.match(r"^(\*+)\s", line)
+            if h:
+                lvl = len(h.group(1))
+                # スタックをこのレベルまで巻き戻す
+                while len(section_stack) > lvl:
+                    section_stack.pop()
+                while len(section_stack) <= lvl:
+                    # 親の設定を引き継ぐ
+                    section_stack.append(dict(section_stack[-1]))
+                current_level = lvl
+                in_properties = False
+                continue
+
+        # ── PROPERTIES ブロック ──────────────────────────────────────────
+        if not in_src:
+            if line.strip() == ":PROPERTIES:":
+                in_properties = True
+                continue
+            if line.strip() == ":END:":
+                in_properties = False
+                continue
+            if in_properties:
+                m = _HEADER_ARGS_RE.match(line)
+                if m:
+                    lang_key = (m.group(1) or "").lower()
+                    tangle_val = _extract_tangle(m.group(2))
+                    if tangle_val is not None:
+                        section_stack[-1][lang_key] = tangle_val
+                    elif ":tangle" in m.group(2).lower():
+                        # :tangle no が明示されている
+                        section_stack[-1][lang_key] = None
+                continue
+
+        # ── #+BEGIN_SRC ──────────────────────────────────────────────────
+        if not in_src:
+            m = _BEGIN_SRC_RE.match(line)
+            if m:
+                lang = m.group(1).lower()
+                header_rest = m.group(2) or ""
+
+                # tangle 解決の優先順位:
+                # 1. ブロック自身の :tangle
+                # 2. セクション :header-args:lang:
+                # 3. セクション :header-args: (言語非限定)
+                # 4. ファイル #+PROPERTY: header-args:lang:
+                # 5. ファイル #+PROPERTY: header-args: (言語非限定)
+                block_tangle = _extract_tangle(header_rest)
+
+                if block_tangle is None and ":tangle" not in header_rest.lower():
+                    # ブロックに :tangle 指定がない → セクション設定を探す
+                    sec = section_stack[-1]
+                    if lang in sec:
+                        block_tangle = sec[lang]
+                    elif "" in sec:
+                        block_tangle = sec[""]
+                    elif lang in file_defaults:
+                        block_tangle = file_defaults[lang]
+                    elif "" in file_defaults:
+                        block_tangle = file_defaults[""]
+
+                in_src = True
+                src_lang = lang
+                src_tangle = block_tangle
+                src_lines = []
+                src_start_line = lineno
+                continue
+
+        # ── #+END_SRC ────────────────────────────────────────────────────
+        else:
+            if _END_SRC_RE.match(line):
+                if src_tangle:
+                    blocks.append(Block(
+                        tangle=src_tangle,
+                        lang=src_lang,
+                        content="\n".join(src_lines),
+                        src_line=src_start_line,
+                    ))
+                in_src = False
+                src_lang = ""
+                src_tangle = None
+                src_lines = []
+                continue
+            src_lines.append(line)
+
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# 書き出し
+# ---------------------------------------------------------------------------
+
+def write_files(
+    blocks: list[Block],
+    base_dir: Path,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """ブロック群をファイルに書き出す.
+
+    Returns:
+        {出力パス: 書き出したブロック数} の辞書
+    """
+    # tangle パスごとにブロックを集約（順序保持）
+    file_blocks: dict[str, list[Block]] = {}
+    for block in blocks:
+        file_blocks.setdefault(block.tangle, []).append(block)
+
+    result: dict[str, int] = {}
+
+    for rel_path, blks in file_blocks.items():
+        out_path = base_dir / rel_path
+        result[rel_path] = len(blks)
+
+        if dry_run:
+            continue
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            for i, blk in enumerate(blks):
+                if i > 0:
+                    f.write("\n")
+                content = textwrap.dedent(blk.content)
+                f.write(content)
+                if content and not content.endswith("\n"):
+                    f.write("\n")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Org-babel tangle を Python で実行する",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "org_file",
+        nargs="?",
+        default="README.org",
+        help="Org ファイルのパス（デフォルト: README.org）",
+    )
+    parser.add_argument(
+        "--out", "-o",
+        default=None,
+        help="出力ベースディレクトリ（デフォルト: org ファイルと同じディレクトリ）",
+    )
+    parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="ファイルを書き出さずにtangleターゲットの一覧のみ表示",
+    )
+    parser.add_argument(
+        "--lang",
+        default=None,
+        help="指定した言語のブロックのみ処理（例: python, toml）",
+    )
+    parser.add_argument(
+        "--file", "-f",
+        default=None,
+        help="指定したtangleパスのブロックのみ処理（例: retranscribe/cli.py）",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="処理中の詳細を表示",
+    )
+
+    args = parser.parse_args()
+
+    org_path = Path(args.org_file)
+    if not org_path.exists():
+        print(f"Error: {org_path} が見つかりません", file=sys.stderr)
+        sys.exit(1)
+
+    base_dir = Path(args.out) if args.out else org_path.parent
+
+    # 読み込みとパース
+    text = org_path.read_text(encoding="utf-8")
+    blocks = parse_org(text)
+
+    # フィルタリング
+    if args.lang:
+        blocks = [b for b in blocks if b.lang == args.lang.lower()]
+    if args.file:
+        blocks = [b for b in blocks if b.tangle == args.file]
+
+    if not blocks:
+        print("tangle対象ブロックが見つかりませんでした。")
+        sys.exit(0)
+
+    # 書き出し
+    result = write_files(blocks, base_dir, dry_run=args.dry_run)
+
+    # 結果表示
+    if args.dry_run:
+        print(f"[dry-run] tangle対象: {len(result)} ファイル")
+        for rel, count in sorted(result.items()):
+            print(f"  {rel}  ({count} ブロック)")
+    else:
+        total_blocks = sum(result.values())
+        print(f"tangle完了: {len(result)} ファイル / {total_blocks} ブロック")
+        if args.verbose:
+            for rel, count in sorted(result.items()):
+                out = base_dir / rel
+                size = out.stat().st_size
+                print(f"  {rel}  ({count} ブロック, {size:,} bytes)")
+        else:
+            for rel in sorted(result.keys()):
+                print(f"  {rel}")
+
+
+if __name__ == "__main__":
+    main()
 #+END_SRC
 
 * コアパイプライン
@@ -1350,6 +1753,647 @@ Suno で生成した楽曲を retranscribe パイプラインに取り込むた�
 Suno のページ構造は変更されやすいため、スクレイピング失敗時は =style= を空のままにして続行する。
 BPM と Key は音声から確実に取得できるため手動指定不要。
 
+*** ライブラリ管理スクリプト
+
+| スクリプト | 役割 |
+|---|---|
+| =suno/library_fetch.py= | 各 suno-api インスタンスから全曲を一括取得し =suno_library_<id>.json= に保存 |
+| =suno/accounts.py= | =accounts.json= の CRUD・疎通確認（ping）を提供する CLI |
+| =accounts.json.example= | インスタンス設定のサンプルファイル（tangle で生成） |
+
+これら 3 ファイルは =suno/cli_suno.py= と独立して動作する。
+=library_fetch.py= の出力 JSON を =retranscribe-suno --library-json= に渡すことで
+suno-api への再クエリなしにバッチ採譜を実行できる。
+
+** accounts.json.example — インスタンス設定サンプル
+:PROPERTIES:
+:CUSTOM_ID: suno-accounts-example
+:END:
+
+各エントリが 1 つの suno-api インスタンスに対応する。
+=suno/accounts.py= で追加・更新・削除・疎通確認を行う。
+
+#+BEGIN_SRC json :tangle accounts.json.example
+[
+  {
+    "id": "ac1965",
+    "base_url": "http://localhost:3000",
+    "added_at": "2026-03-30T00:00:00+00:00",
+    "updated_at": "2026-03-30T00:00:00+00:00"
+  },
+  {
+    "id": "sub01",
+    "base_url": "http://localhost:3001",
+    "added_at": "2026-03-30T00:00:00+00:00",
+    "updated_at": "2026-03-30T00:00:00+00:00"
+  }
+]
+#+END_SRC
+
+** suno/accounts.py — accounts.json CLI 管理ツール
+:PROPERTIES:
+:CUSTOM_ID: suno-accounts
+:END:
+
+各アカウント = 1 つの suno-api インスタンス（別ポートで起動）。
+Cookie はサーバー側（=SUNO_COOKIE= 環境変数）で管理するため、
+スクリプト側は =base_url= のみを保持する。
+
+#+BEGIN_SRC python :tangle retranscribe/suno/accounts.py
+#!/usr/bin/env python3
+"""
+suno/accounts.py — accounts.json CLI 管理ツール
+
+各アカウント = 1つの suno-api インスタンス（別ポートで起動）。
+Cookie はサーバー側（SUNO_COOKIE 環境変数）で管理するため、
+スクリプト側は base_url のみを保持する。
+
+accounts.json フォーマット:
+  [
+    { "id": "ac1965", "base_url": "http://localhost:3000" },
+    { "id": "sub01",  "base_url": "http://localhost:3001" }
+  ]
+
+サブコマンド:
+  list                          登録済みアカウントを一覧表示
+  add    --id ID --url URL      アカウントを追加
+  update --id ID --url URL      base_url を更新
+  remove --id ID                アカウントを削除
+  show   --id ID                1件の詳細
+  ping   [--id ID]              疎通確認（省略時は全アカウント）
+
+使用例:
+  python retranscribe/suno/accounts.py add --id ac1965 --url http://localhost:3000
+  python retranscribe/suno/accounts.py list
+  python retranscribe/suno/accounts.py ping
+  python retranscribe/suno/accounts.py update --id ac1965 --url http://localhost:3002
+  python retranscribe/suno/accounts.py remove --id sub01
+"""
+
+from __future__ import annotations
+import argparse, json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+try:
+    import httpx
+except ImportError:
+    httpx = None  # ping のみ必要
+
+DEFAULT_FILE = "accounts.json"
+
+# ---------------------------------------------------------------------------
+def load(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            print(f"✗ {path} のルートは JSON 配列である必要があります。"); sys.exit(1)
+        return data
+    except json.JSONDecodeError as e:
+        print(f"✗ JSON パースエラー: {e}"); sys.exit(1)
+
+def save(path: Path, data: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def find_idx(data: list[dict], account_id: str) -> int | None:
+    for i, e in enumerate(data):
+        if e.get("id") == account_id:
+            return i
+    return None
+
+# ---------------------------------------------------------------------------
+def cmd_list(args: argparse.Namespace) -> int:
+    data = load(Path(args.file))
+    if not data:
+        print(f"(アカウントが登録されていません: {args.file})")
+        return 0
+    print(f"{'ID':<20}  {'base_url':<35}  {'登録日時'}")
+    print("-" * 75)
+    for e in data:
+        print(f"{e['id']:<20}  {e.get('base_url',''):<35}  {e.get('added_at','—')}")
+    print(f"\n合計: {len(data)} アカウント  ({args.file})")
+    return 0
+
+def cmd_add(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    data = load(path)
+    if find_idx(data, args.id) is not None:
+        print(f"✗ ID '{args.id}' は既に登録されています。update を使用してください。")
+        return 1
+    now = datetime.now(timezone.utc).isoformat()
+    data.append({"id": args.id, "base_url": args.url, "added_at": now, "updated_at": now})
+    save(path, data)
+    print(f"✓ 追加: '{args.id}' → {args.url}  ({path})")
+    return 0
+
+def cmd_update(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    data = load(path)
+    idx = find_idx(data, args.id)
+    if idx is None:
+        print(f"✗ ID '{args.id}' が見つかりません。"); return 1
+    data[idx]["base_url"] = args.url
+    data[idx]["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save(path, data)
+    print(f"✓ 更新: '{args.id}' → {args.url}  ({path})")
+    return 0
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    data = load(path)
+    idx = find_idx(data, args.id)
+    if idx is None:
+        print(f"✗ ID '{args.id}' が見つかりません。"); return 1
+    data.pop(idx)
+    save(path, data)
+    print(f"✓ 削除: '{args.id}'  ({path})")
+    return 0
+
+def cmd_show(args: argparse.Namespace) -> int:
+    data = load(Path(args.file))
+    idx = find_idx(data, args.id)
+    if idx is None:
+        print(f"✗ ID '{args.id}' が見つかりません。"); return 1
+    print(json.dumps(data[idx], ensure_ascii=False, indent=2))
+    return 0
+
+def cmd_ping(args: argparse.Namespace) -> int:
+    if httpx is None:
+        print("✗ httpx が必要です: pip install httpx"); return 1
+    data = load(Path(args.file))
+    targets = [e for e in data if not args.id or e["id"] == args.id]
+    if not targets:
+        print(f"✗ 対象アカウントが見つかりません。"); return 1
+    ok_count = 0
+    for e in targets:
+        url = f"{e.get('base_url','').rstrip('/')}/api/get_limit"
+        try:
+            r = httpx.get(url, timeout=10)
+            r.raise_for_status()
+            info = r.json()
+            credits = info.get("credits_left", "?")
+            print(f"  ✓ {e['id']:<20}  {e['base_url']}  credits_left={credits}")
+            ok_count += 1
+        except httpx.ConnectError:
+            print(f"  ✗ {e['id']:<20}  {e['base_url']}  接続失敗（サーバー未起動？）")
+        except httpx.HTTPStatusError as ex:
+            body = ex.response.text[:120]
+            if any(kw in body for kw in ("session id", "SUNO_COOKIE")):
+                print(f"  ⚠ {e['id']:<20}  {e['base_url']}  Cookie 失効（SUNO_COOKIE を更新してください）")
+            else:
+                print(f"  ✗ {e['id']:<20}  HTTP {ex.response.status_code}")
+    print(f"\n疎通: {ok_count}/{len(targets)}")
+    return 0 if ok_count == len(targets) else 1
+
+# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="suno-api アカウント（インスタンス）管理ツール")
+    p.add_argument("--file", default=DEFAULT_FILE, help=f"accounts.json のパス (デフォルト: {DEFAULT_FILE})")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="登録済みアカウントを一覧表示")
+
+    a = sub.add_parser("add", help="アカウントを追加")
+    a.add_argument("--id",  required=True)
+    a.add_argument("--url", required=True, help="suno-api の base_url (例: http://localhost:3000)")
+
+    u = sub.add_parser("update", help="base_url を更新")
+    u.add_argument("--id",  required=True)
+    u.add_argument("--url", required=True)
+
+    r = sub.add_parser("remove", help="アカウントを削除")
+    r.add_argument("--id", required=True)
+
+    s = sub.add_parser("show", help="1件の詳細")
+    s.add_argument("--id", required=True)
+
+    pg = sub.add_parser("ping", help="suno-api インスタンスの疎通確認")
+    pg.add_argument("--id", default=None, help="省略時は全アカウント")
+
+    return p.parse_args()
+
+def main() -> int:
+    args = parse_args()
+    return {"list": cmd_list, "add": cmd_add, "update": cmd_update,
+            "remove": cmd_remove, "show": cmd_show, "ping": cmd_ping}[args.command](args)
+
+if __name__ == "__main__":
+    sys.exit(main())
+#+END_SRC
+
+** suno/library_fetch.py — ライブラリ一括取得スクリプト
+:PROPERTIES:
+:CUSTOM_ID: suno-library-fetch
+:END:
+
+gcui-art/suno-api インスタンスから全曲を取得し =suno_library_<id>.json= に保存する。
+認証は suno-api サーバー側（=SUNO_COOKIE= 環境変数）で管理するため、
+スクリプト側は =base_url= のみを使用し Cookie を一切扱わない。
+
+出力 JSON は =retranscribe-suno --library-json= に渡すことで
+suno-api への再クエリなしにバッチ採譜を実行できる（詳細は [[#suno-cli][suno/cli_suno.py]] 参照）。
+
+#+BEGIN_SRC python :tangle retranscribe/suno/library_fetch.py
+#!/usr/bin/env python3
+"""
+suno/library_fetch.py  (v3 — base_url モデル)
+gcui-art/suno-api インスタンスから曲ライブラリを取得して JSON に保存する。
+
+認証は suno-api サーバー側（SUNO_COOKIE 環境変数）で管理する。
+スクリプト側は base_url のみを使用し、Cookie を一切扱わない。
+
+■ accounts.json フォーマット
+  [
+    { "id": "ac1965", "base_url": "http://localhost:3000" },
+    { "id": "sub01",  "base_url": "http://localhost:3001" }
+  ]
+
+■ 使用例
+  # 複数アカウント一括
+  python retranscribe/suno/library_fetch.py --accounts-file accounts.json --output-dir ./libraries
+
+  # 単一インスタンス
+  python retranscribe/suno/library_fetch.py --base-url http://localhost:3000 --account-id ac1965
+"""
+
+from __future__ import annotations
+import argparse, json, os, sys, time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+import httpx
+
+# ---------------------------------------------------------------------------
+# Cookie 失効検出（サーバー側の SUNO_COOKIE が古い場合に検出）
+# ---------------------------------------------------------------------------
+
+class CookieExpiredError(Exception):
+    pass
+
+EXPIRY_KEYWORDS = ("session id", "SUNO_COOKIE", "update the", "Failed to get")
+
+def check_session_valid(limit_info: dict) -> None:
+    """
+    /api/get_limit レスポンスからセッション失効シグナルを検出する。
+    失効はサーバー側の SUNO_COOKIE が古いことを意味する。
+    """
+    if "error" in limit_info:
+        raise CookieExpiredError(f"サーバーエラー応答: {limit_info['error']}")
+    if limit_info.get("credits_left") is None and "monthly_limit" not in limit_info:
+        raise CookieExpiredError("credits_left フィールドが存在しません")
+
+SESSION_UPDATE_HINT = """\
+    セッション更新手順（サーバー側）:
+      1. ブラウザで suno.com/create を開く
+      2. F12 → Network タブ → ページリロード
+      3. ?__clerk_api_version を含むリクエストの Headers → Cookie の値をコピー
+      4. suno-api サーバーの SUNO_COOKIE 環境変数を更新して再起動する\
+"""
+
+# ---------------------------------------------------------------------------
+@dataclass
+class Account:
+    id: str
+    base_url: str
+
+# ---------------------------------------------------------------------------
+class SunoApiClient:
+    """1つの suno-api インスタンスに対応するクライアント。Cookie は不要。"""
+
+    def __init__(self, base_url: str, timeout: float = 30.0):
+        self.base_url = base_url.rstrip("/")
+        self._http = httpx.Client(timeout=timeout)
+
+    def get_limit(self) -> dict:
+        r = self._http.get(f"{self.base_url}/api/get_limit")
+        r.raise_for_status()
+        return r.json()
+
+    def get_songs_page(self, page: int, page_size: int = 20) -> list[dict]:
+        """1ページ分を取得する。空リストで末尾を検出する。"""
+        r = self._http.get(
+            f"{self.base_url}/api/get",
+            params={"page": page, "page_size": page_size},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list): return data
+        if isinstance(data, dict):
+            for key in ("songs", "data", "items", "results"):
+                if key in data and isinstance(data[key], list): return data[key]
+        return []
+
+    def get_all_songs(self, page_size: int = 20) -> list[dict]:
+        """全ページを順に取得して結合する。空ページが返った時点で終了。"""
+        all_songs: list[dict] = []
+        seen_ids: set[str] = set()
+        page = 0
+        while True:
+            batch = self.get_songs_page(page=page, page_size=page_size)
+            if not batch:
+                break
+            new = [s for s in batch if s.get("id") and s["id"] not in seen_ids]
+            if not new:
+                break  # 重複のみ → 末尾到達
+            for s in new:
+                seen_ids.add(s["id"])
+            all_songs.extend(new)
+            print(f"    page {page}: {len(new)}件 (累計 {len(all_songs)}件)")
+            if len(batch) < page_size:
+                break  # 最終ページ
+            page += 1
+        return all_songs
+
+    def get_by_ids(self, ids: list[str], chunk_size: int = 50) -> dict[str, dict]:
+        """
+        /api/get?ids=id1,id2,... で詳細取得。
+        HTTP エラーや例外が発生した場合は空辞書を返す（呼び出し側でフォールバック）。
+        戻り値: {id: raw_dict}  失敗時: {}
+        """
+        result: dict[str, dict] = {}
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            try:
+                r = self._http.get(
+                    f"{self.base_url}/api/get",
+                    params={"ids": ",".join(chunk)},
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                print(f"    ⚠ /api/get?ids 失敗 (chunk {i//chunk_size}): {e}")
+                return {}  # 全チャンク失敗扱いでフォールバックへ
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = next(
+                    (data[k] for k in ("songs","data","items","results")
+                     if k in data and isinstance(data[k], list)),
+                    []
+                )
+            else:
+                items = []
+            for item in items:
+                if item.get("id"):
+                    result[item["id"]] = item
+        return result
+
+    def get_clip(self, song_id: str) -> dict | None:
+        """/api/clip?id=<id> で1件取得（is_public を含む詳細）。"""
+        try:
+            r = self._http.get(f"{self.base_url}/api/clip", params={"id": song_id})
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "id" in data:
+                return data
+        except Exception:
+            pass
+        return None
+
+    def close(self): self._http.close()
+
+# ---------------------------------------------------------------------------
+FIELD_ALIASES: dict[str, list[str]] = {
+    "audio_url":  ["audio_url", "stream_audio_url", "mp3_url"],
+    "image_url":  ["image_url", "image", "cover_image_url", "thumbnail_url"],
+    "lyric":      ["lyric", "lyrics", "lyric_text"],
+    "tags":       ["tags", "genre", "style", "music_style"],
+    "model_name": ["model_name", "model", "version"],
+    "created_at": ["created_at", "create_time", "timestamp"],
+    "duration":   ["duration", "duration_seconds", "length"],
+    "status":     ["status", "state"],
+    "is_public":  ["is_public"],
+    "is_liked":   ["is_liked"],
+    "play_count": ["play_count"],
+}
+
+def normalize_song(raw: dict) -> dict:
+    s: dict = {"id": raw.get("id",""), "title": raw.get("title","")}
+    for canonical, aliases in FIELD_ALIASES.items():
+        for alias in aliases:
+            if alias in raw and raw[alias] is not None:
+                s[canonical] = raw[alias]; break
+        else:
+            s[canonical] = None
+    s["_raw"] = raw
+    return s
+
+def fetch_library(client: SunoApiClient) -> list[dict]:
+    """
+    全ページを取得して正規化済みリストを返す。
+
+    /api/get（一括）は is_public を省略する場合があるため、
+    ID指定の /api/get?ids=... で再取得して is_public を補完する。
+    それでも取得できない場合は /api/clip にフォールバックする。
+    """
+    raw_list = client.get_all_songs()
+    if not raw_list:
+        return []
+
+    # is_public が既に含まれているか確認
+    has_visibility = any("is_public" in r for r in raw_list)
+
+    if not has_visibility:
+        print("    → is_public なし。/api/get?ids=... で補完を試みます...")
+        ids = [r["id"] for r in raw_list if r.get("id")]
+        detailed = client.get_by_ids(ids)
+
+        # 詳細取得で is_public が取れたか確認
+        sample = next(iter(detailed.values()), {})
+        if "is_public" not in sample:
+            print("    → /api/get?ids でも is_public なし。/api/clip にフォールバック...")
+            enriched = []
+            for raw in raw_list:
+                sid = raw.get("id","")
+                clip = client.get_clip(sid) if sid else None
+                if clip and "is_public" in clip:
+                    raw = {**raw, "is_public": clip["is_public"]}
+                enriched.append(raw)
+            raw_list = enriched
+        else:
+            # detailed から is_public などを上書きマージ
+            raw_list = [
+                {**raw, **{k: v for k, v in detailed.get(raw.get("id",""), {}).items()
+                           if k in ("is_public","is_liked","play_count")}}
+                for raw in raw_list
+            ]
+
+    songs = [normalize_song(raw) for raw in raw_list]
+    pub  = sum(1 for s in songs if s.get("is_public") is True)
+    priv = sum(1 for s in songs if s.get("is_public") is False)
+    unkn = sum(1 for s in songs if s.get("is_public") is None)
+    print(f"    → 公開:{pub} / 非公開:{priv} / 不明:{unkn}")
+    return songs
+
+# ---------------------------------------------------------------------------
+def resolve_output_path(account_id: str, output_dir: Optional[str], single_output: Optional[str]) -> Path:
+    if single_output: return Path(single_output)
+    base = Path(output_dir) if output_dir else Path(".")
+    return base / f"suno_library_{account_id}.json"
+
+def save_library(songs: list[dict], account: Account, path: Path, no_raw: bool) -> None:
+    if no_raw:
+        songs = [{k:v for k,v in s.items() if k != "_raw"} for s in songs]
+    payload = {
+        "account_id": account.id,
+        "base_url":   account.base_url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "total":      len(songs),
+        "songs":      songs,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ---------------------------------------------------------------------------
+def build_accounts(args: argparse.Namespace) -> list[Account]:
+    if args.accounts_file:
+        data = json.loads(Path(args.accounts_file).read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("accounts-file のルートは JSON 配列である必要があります。")
+        return [Account(id=e["id"], base_url=e["base_url"]) for e in data]
+    # 単一インスタンス
+    base_url = args.base_url or os.environ.get("SUNO_API_BASE_URL", "http://localhost:3000")
+    return [Account(id=args.account_id or "default", base_url=base_url)]
+
+# ---------------------------------------------------------------------------
+def _check_limit_with_retry(client: SunoApiClient, account_id: str,
+                             retry: int, retry_interval: float) -> dict | None:
+    last_error = ""
+    for attempt in range(1, retry + 2):
+        label = f"試行 {attempt}/{retry+1}"
+        try:
+            limit_info = client.get_limit()
+            check_session_valid(limit_info)
+            return limit_info
+        except CookieExpiredError as e:
+            # 失効確定 — リトライしても意味がない
+            print(f"  ⚠ [{label}] セッション失効: {e}")
+            print(f"  → suno-api サーバー（{client.base_url}）の SUNO_COOKIE を更新してください。")
+            print(SESSION_UPDATE_HINT)
+            return None
+        except httpx.HTTPStatusError as e:
+            body = e.response.text
+            if any(kw in body for kw in EXPIRY_KEYWORDS):
+                print(f"  ⚠ [{label}] セッション失効 (HTTP {e.response.status_code})")
+                print(f"  → suno-api サーバー（{client.base_url}）の SUNO_COOKIE を更新してください。")
+                print(SESSION_UPDATE_HINT)
+                return None
+            last_error = f"HTTP {e.response.status_code}: {body[:120]}"
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            last_error = str(e)
+
+        if attempt <= retry:
+            print(f"  ⚠ [{label}] {last_error} — {retry_interval}秒後にリトライ...")
+            time.sleep(retry_interval)
+
+    print(f"  ✗ {retry+1}回試行後も接続できませんでした: {last_error}")
+    return None
+
+def process_account(account: Account, timeout: float,
+                    output_dir: Optional[str], single_output: Optional[str],
+                    no_raw: bool, retry: int, retry_interval: float) -> bool:
+    print(f"\n{'='*60}")
+    print(f"  アカウント : {account.id}")
+    print(f"  base_url  : {account.base_url}")
+
+    client = SunoApiClient(base_url=account.base_url, timeout=timeout)
+
+    print(f"  [1/3] 接続確認 (/api/get_limit, 最大{retry+1}回)...")
+    limit_info = _check_limit_with_retry(client, account.id, retry, retry_interval)
+    if limit_info is None:
+        client.close(); return False
+    print(f"        クォータ: {json.dumps(limit_info, ensure_ascii=False)}")
+
+    print("  [2/3] ライブラリ取得中 (/api/get)...")
+    try:
+        songs = fetch_library(client)
+    except httpx.HTTPStatusError as e:
+        print(f"  ✗ HTTP {e.response.status_code}: {e.response.text[:200]}")
+        return False
+    finally:
+        client.close()
+
+    if not songs:
+        print("  ✗ 曲が取得できませんでした。サーバーのセッション状態を確認してください。")
+        return False
+
+    output_path = resolve_output_path(account.id, output_dir, single_output)
+    print(f"  [3/3] 保存 → {output_path.resolve()}")
+    save_library(songs, account, output_path, no_raw)
+
+    a = sum(1 for s in songs if s.get("audio_url"))
+    l = sum(1 for s in songs if s.get("lyric"))
+    t = sum(1 for s in songs if s.get("image_url"))
+    print(f"  ✓ {len(songs)}曲  音源URL:{a} / 歌詞:{l} / サムネイル:{t}")
+    return True
+
+# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="gcui-art/suno-api インスタンスから曲ライブラリを JSON に保存",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用例:
+  python retranscribe/suno/library_fetch.py --accounts-file accounts.json --output-dir ./libraries
+  python retranscribe/suno/library_fetch.py --base-url http://localhost:3000 --account-id ac1965
+  python retranscribe/suno/library_fetch.py --accounts-file accounts.json --retry 5 --retry-interval 60
+""")
+    g = p.add_argument_group("アカウント指定")
+    g.add_argument("--accounts-file", help="accounts.json のパス（複数インスタンス）")
+    g.add_argument("--base-url",      default=None, help="suno-api の URL（単一インスタンス）")
+    g.add_argument("--account-id",    default=None, help="アカウント識別子（ファイル名に使用）")
+    o = p.add_argument_group("出力設定")
+    o.add_argument("--output",     default=None)
+    o.add_argument("--output-dir", default=None)
+    o.add_argument("--no-raw",     action="store_true", help="_raw フィールドを除外する")
+    c = p.add_argument_group("接続・リトライ設定")
+    c.add_argument("--timeout",        type=float, default=30.0)
+    c.add_argument("--retry",          type=int,   default=3)
+    c.add_argument("--retry-interval", type=float, default=30.0)
+    return p.parse_args()
+
+def main() -> int:
+    args = parse_args()
+    print("[suno_library_fetch v3]")
+
+    if args.accounts_file and args.base_url:
+        print("✗ --accounts-file と --base-url は同時使用不可"); return 1
+    if args.accounts_file and args.output:
+        print("✗ 複数アカウントモードでは --output-dir を使用してください"); return 1
+
+    try:
+        accounts = build_accounts(args)
+    except (ValueError, FileNotFoundError, KeyError) as e:
+        print(f"✗ アカウント設定エラー: {e}"); return 1
+
+    print(f"  対象インスタンス数: {len(accounts)}")
+    success, failed = 0, 0
+    for account in accounts:
+        ok = process_account(
+            account=account,
+            timeout=args.timeout,
+            output_dir=args.output_dir,
+            single_output=args.output if len(accounts) == 1 else None,
+            no_raw=args.no_raw,
+            retry=args.retry,
+            retry_interval=args.retry_interval,
+        )
+        if ok: success += 1
+        else:  failed  += 1
+
+    print(f"\n{'='*60}")
+    print(f"完了: 成功 {success} / 失敗 {failed} / 合計 {len(accounts)}")
+    if failed > 0:
+        print(f"  ⚠ {failed} インスタンスが失敗。上記の警告を確認してください。")
+    return 0 if failed == 0 else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+#+END_SRC
+
 ** suno/__init__.py
 :PROPERTIES:
 :CUSTOM_ID: suno-init
@@ -2315,6 +3359,12 @@ def ingest_and_transcribe(
         help="SunoのURL、またはローカルMP3/WAVファイルパス。--suno-id 指定時は省略可"),
     suno_id: Optional[str] = typer.Option(None, "--suno-id",
         help="SunoのクリップID（UUID）。--source 未指定時に suno-api でメタデータ・音源を補完する"),
+    library_json: Optional[pathlib.Path] = typer.Option(None, "--library-json",
+        help=(
+            "library_fetch.py が出力した suno_library_<id>.json のパス。"
+            "指定すると songs[] を順に採譜してバッチ実行する。"
+            "--source / --suno-id との同時指定不可。"
+        )),
     suno_api_url: str = typer.Option("http://localhost:3000", "--suno-api-url",
         help="gcui-art/suno-api サーバーのベースURL（SUNO_COOKIE 設定済みのセルフホスト環境）"),
     title: Optional[str] = typer.Option(None, "--title", "-t",
@@ -2347,10 +3397,36 @@ def ingest_and_transcribe(
     title・lyrics・style・created_at・duration・image_url・audio_url を自動取得し、
     audio_url を音源としてパイプラインを実行する。
     --suno-id を別途指定した場合は --source 未指定でも補完として使用できる。
+
+    --library-json を指定した場合は library_fetch.py の出力 JSON を読み込み、
+    songs[] の各エントリを順に採譜する（バッチモード）。
+    このとき audio_url・title・lyric・tags を直接使用するため
+    suno-api への再クエリは発生しない。
     """
     import warnings
     if not verbose:
         warnings.filterwarnings("ignore")
+
+    # --library-json バッチモード
+    if library_json is not None:
+        if source or suno_id:
+            console.print("[red]--library-json と --source / --suno-id は同時に指定できません。[/red]")
+            raise typer.Exit(1)
+        _run_batch_from_library(
+            library_json=library_json,
+            suno_api_url=suno_api_url,
+            output_dir=output_dir,
+            org_library=org_library,
+            style=style,
+            n_hypotheses=n_hypotheses,
+            device=device,
+            snap_pitch=snap_pitch,
+            no_pdf=no_pdf,
+            musescore_cmd=musescore_cmd,
+            hugo=hugo,
+            verbose=verbose,
+        )
+        return
 
     # --source / --suno-id の両方未指定はエラー
     if not source and not suno_id:
@@ -2509,6 +3585,77 @@ def ingest_and_transcribe(
             console.print(f"  {label:12}: [green]{result[key_name]}[/green]")
 
 
+def _run_batch_from_library(
+    library_json: pathlib.Path,
+    suno_api_url: str,
+    output_dir: Optional[pathlib.Path],
+    org_library: Optional[pathlib.Path],
+    style: str,
+    n_hypotheses: int,
+    device: str,
+    snap_pitch: bool,
+    no_pdf: bool,
+    musescore_cmd: str,
+    hugo: bool,
+    verbose: bool,
+) -> None:
+    """library_fetch.py 出力 JSON の songs[] を順に採譜するバッチ実行。
+
+    各エントリの audio_url・title・lyric・tags を ingest() に直接渡すため
+    suno-api への再クエリは発生しない。
+    audio_url が存在しないエントリはスキップする。
+    """
+    import json as _json
+    payload = _json.loads(library_json.read_text(encoding="utf-8"))
+    songs = payload.get("songs", [])
+    if not songs:
+        console.print(f"[yellow]--library-json に songs エントリがありません: {library_json}[/yellow]")
+        return
+
+    console.print(f"[bold]バッチモード: {len(songs)}曲  ({library_json.name})[/bold]")
+    ok_count = skip_count = err_count = 0
+
+    from retranscribe.suno.ingest import ingest
+
+    for idx, song in enumerate(songs, 1):
+        song_id    = song.get("id", "unknown")
+        song_title = song.get("title") or song_id
+        audio_url  = song.get("audio_url")
+        if not audio_url:
+            console.print(f"  [{idx}/{len(songs)}] [dim]スキップ (audio_url なし): {song_title}[/dim]")
+            skip_count += 1
+            continue
+
+        console.rule(f"[{idx}/{len(songs)}] {song_title}")
+        try:
+            _style       = style or ",".join(song.get("tags") or [])
+            _lyrics_text = song.get("lyric") or None
+            _output      = output_dir or (
+                pathlib.Path("suno_output") / song_title.replace("/", "_").replace(" ", "_")
+            )
+            _output.mkdir(parents=True, exist_ok=True)
+
+            wav_path, meta = ingest(
+                source=audio_url,
+                title=song.get("title"),
+                lyrics_text=_lyrics_text,
+                output_dir=_output,
+                style_tags=_style,
+                prompt=None,
+                suno_api_url=None,   # バッチモードでは再クエリしない
+            )
+            console.print(f"  [green]✓ ingest 完了: {wav_path}[/green]")
+            ok_count += 1
+        except Exception as exc:
+            console.print(f"  [red]✗ {song_title}: {exc}[/red]")
+            err_count += 1
+
+    console.rule("[bold]バッチ完了[/bold]")
+    console.print(
+        f"  成功: {ok_count}  スキップ: {skip_count}  失敗: {err_count}  合計: {len(songs)}"
+    )
+
+
 if __name__ == "__main__":
     app()
 #+END_SRC
@@ -2531,6 +3678,12 @@ if __name__ == "__main__":
 - magenta（Onsets and Frames）は pip install magenta で別途手動インストールが必要
 - torchaudio は 2.7 系に固定（LazyModule resample エラー回避のため）
 - madmom は build 時に Cython と numpy が必要（=uv.extra-build-dependencies= で対処済み）
+- =library_fetch.py= の =--no-raw= を指定すると =_raw= フィールドが除外される。
+  =--library-json= バッチモードで必要なフィールドは正規化済みトップレベルキー
+  （=audio_url=, =title=, =lyric=, =tags=）のみであるため、=--no-raw= との組み合わせに問題はない
+- =--library-json= バッチモードの =_run_batch_from_library()= は =ingest()= のみを呼び出す。
+  Stem分離・仮説生成・エクスポートを含むフルパイプラインは現時点では未実装であり、
+  個別の =retranscribe-suno --source <audio_url>= 呼び出しで実行すること
 
 ** ライセンス
 

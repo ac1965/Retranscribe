@@ -1,6 +1,9 @@
 retranscribe
 pyproject.toml
 retranscribe.egg-info
-sprig_snow.mp3
+accounts.json
+accounts.json.example
+*.mp3
 uv.lock
 suno_output
+.DS_Store
