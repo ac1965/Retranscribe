@@ -51,34 +51,30 @@ uv run retranscribe ./input/song.flac --no-pdf
 ** Suno 音源の採譜
 
 #+BEGIN_SRC bash :tangle no
-# URL から自動取得
-uv run retranscribe-suno \
-  --source "https://suno.com/song/abc-123" \
-  --title "8ビットの夜風" \
-  --lyrics ~/Downloads/lyrics.txt \
-  --org-library ~/Music/suno_library.org
+  # URL を渡すだけで suno-api が自動的に叩かれる（推奨）
+  # suno-api のデフォルトポートは 3000
+  uv run retranscribe-suno \
+    --source "https://suno.com/song/9164e8ce-128a-4fd0-a632-a6c43d251579" \
+    --suno-api-url "http://localhost:4000" \
+    --org-library ~/Music/suno_library.org
 
-# ローカル MP3 から採譜
-uv run retranscribe-suno \
-  --source ~/Downloads/8ビットの夜風.mp3 \
-  --title "8ビットの夜風" \
-  --lyrics ~/Downloads/lyrics.txt \
-  --style "j-pop, lo-fi, 8bit" \
-  --output ~/Music/suno/8ビットの夜風
+  # suno-api なしで URL のみ（__NEXT_DATA__ スクレイピング + yt-dlp ダウンロード）
+  uv run retranscribe-suno \
+    --source "https://suno.com/song/9164e8ce-128a-4fd0-a632-a6c43d251579"
 
-# gcui-art/suno-api 経由でメタデータ・音源を完全補完
-# (suno-api サーバーを SUNO_COOKIE 付きで起動済みの場合)
-uv run retranscribe-suno \
-  --suno-id "abc-123-uuid" \
-  --suno-api-url "http://localhost:3000" \
-  --org-library ~/Music/suno_library.org
+  # ローカル MP3 から採譜（メタデータは手動指定）
+  uv run retranscribe-suno \
+    --source ~/Downloads/8ビットの夜風.mp3 \
+    --title "8ビットの夜風" \
+    --lyrics ~/Downloads/lyrics.txt \
+    --style "j-pop, lo-fi, 8bit" \
+    --output ~/Music/suno/8ビットの夜風
 
-# ローカル MP3 + suno-api でメタデータのみ補完 (--source と --suno-id 併用)
-uv run retranscribe-suno \
-  --source ~/Downloads/8ビットの夜風.mp3 \
-  --suno-id "abc-123-uuid" \
-  --suno-api-url "http://localhost:3000" \
-  --output ~/Music/suno/8ビットの夜風
+  # --suno-id のみ指定（URL を知らない場合）
+  uv run retranscribe-suno \
+    --suno-id "9164e8ce-128a-4fd0-a632-a6c43d251579" \
+    --suno-api-url "http://localhost:4000" \
+    --org-library ~/Music/suno_library.org
 #+END_SRC
 
 * 設計思想
@@ -1200,7 +1196,8 @@ def estimate_chords(
 :END:
 
 最良仮説から MIDI（pretty_midi）と MusicXML（music21）を生成し、
-MuseScore CLI で PDF に変換する。歌詞タイムスタンプは MIDI Lyric イベントとして埋め込む。
+MuseScore CLI で PDF に変換する。歌詞タイムスタンプは MusicXML / Org に格納する。
+MIDI の Lyric イベントは latin-1 のみ対応のため、非ASCII歌詞（日本語等）は MIDI に埋め込まない。
 
 #+BEGIN_SRC python :tangle retranscribe/score/musicxml_export.py
 """MusicXML / MIDI / PDF エクスポートモジュール."""
@@ -1208,6 +1205,7 @@ MuseScore CLI で PDF に変換する。歌詞タイムスタンプは MIDI Lyri
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 from typing import Any, Optional
 
@@ -1234,7 +1232,7 @@ def export(
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_title = title.replace("/", "_").replace(" ", "_")
+    safe_title = re.sub(r"[^\w\-]", "_", title)  # ASCII英数・ハイフン・アンダースコア以外を_に
     tempo = beat_info.get("tempo_bpm", 120.0)
 
     # --- MIDI 生成 ---
@@ -1257,14 +1255,8 @@ def export(
             ))
         pm.instruments.append(inst)
 
-    # 歌詞をテキストイベントとして埋め込む
-    if lyrics_info:
-        for seg in lyrics_info.get("segments", []):
-            for w in seg.get("words", []):
-                pm.lyrics.append(pretty_midi.Lyric(
-                    text=w.get("word", ""),
-                    time=float(w.get("start", 0)),
-                ))
+    # 注意: MIDI の Lyric イベントは latin-1 エンコードのみ対応（mido の仕様）。
+    # 日本語等の非ASCII歌詞は MusicXML / Org 側に格納するため MIDI には埋め込まない。
 
     midi_path = output_dir / f"{safe_title}.mid"
     pm.write(str(midi_path))
@@ -1374,406 +1366,521 @@ BPM と Key は音声から確実に取得できるため手動指定不要。
 
 URL が渡された場合は =__NEXT_DATA__= スクレイピングでスタイルタグを自動取得し、
 yt-dlp で MP3 をダウンロードする。BPM と Key は WAV 変換後に音声解析で自動推定する。
-=fetch_sunoapi_meta()= を使うと gcui-art/suno-api の =/api/clip= エンドポイントから
-title・lyrics・style・audio_url を補完できる（セルフホスト環境が必要）。
+=fetch_sunoapi_meta()= を使うと gcui-art/suno-api の =/api/get?ids== エンドポイントから
+title・lyrics・style・audio_url 等を補完できる（セルフホスト環境が必要）。
+戻り値は =(dict, Optional[str])= のタプルで、失敗時はエラー理由文字列を返す。
 
 #+BEGIN_SRC python :tangle retranscribe/suno/ingest.py
-"""Suno音源の取り込みモジュール.
-
-機能:
-- Suno URLからyt-dlpでMP3取得（オプション）
-- SunoページHTMLから__NEXT_DATA__経由でスタイルタグ自動取得
-- gcui-art/suno-api の /api/clip エンドポイントからメタデータ補完
-- ローカルMP3ファイルの受け取り
-- 歌詞テキストの受け取りとYAML保存
-- SunoメタデータのDataclass化
-- BPMとキーの音声解析による自動推定
-- ffmpegによるWAV正規化（preprocess.pyへ委譲）
-"""
-
-from __future__ import annotations
-
-import re
-import subprocess
-import pathlib
-import dataclasses
-from typing import Optional
-import yaml
-
-
-# ---------------------------------------------------------------------------
-# データモデル
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass
-class SunoMeta:
-    """Sunoの1曲分のメタデータ."""
-
-    title: str
-    suno_id: str
-    lyrics_raw: str
-    style_tags: list[str]
-    bpm_hint: Optional[float]       # 音声解析で自動推定
-    key_hint: Optional[str]         # 音声解析で自動推定
-    prompt: Optional[str]
-    suno_url: Optional[str]
-    created_at: str
-
-    def to_yaml_dict(self) -> dict:
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_yaml_dict(cls, d: dict) -> "SunoMeta":
-        return cls(**d)
-
-    def update_lyrics(self, text: str) -> None:
-        """WhisperX 書き起こし結果で lyrics_raw を上書きする."""
-        self.lyrics_raw = text
-
-
-# ---------------------------------------------------------------------------
-# Sunoページからのメタデータ自動取得
-# ---------------------------------------------------------------------------
-
-def fetch_suno_page_meta(url: str) -> dict:
-    """SunoページのHTMLを取得し、__NEXT_DATA__ JSONからメタデータを抽出する.
-
-    Returns:
-        取得できたフィールドのみ含むdict。空dictの場合は取得失敗。
-
-    Note:
-        Sunoはログイン必須のページに移行しつつある。
-        セッションクッキーなしでアクセスできない場合は空dictを返す。
-        ページ構造はSunoのデプロイで変わりうるため、失敗時はスキップする。
-    """
-    try:
-        import requests
-    except ImportError:
-        return {}
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0.0.0 Safari/537.36"
-        )
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-    except Exception:
-        return {}
-
-    m = re.search(
-        r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>',
-        resp.text,
-        re.DOTALL,
-    )
-    if not m:
-        return {}
-
-    try:
-        import json
-        data = json.loads(m.group(1))
-    except Exception:
-        return {}
-
-    clip = None
-    candidates = [
-        lambda d: d["props"]["pageProps"]["clip"],
-        lambda d: d["props"]["pageProps"]["initialData"]["clips"][0],
-        lambda d: list(d["props"]["pageProps"]["initialData"].values())[0],
-    ]
-    for getter in candidates:
-        try:
-            clip = getter(data)
-            if clip:
-                break
-        except (KeyError, IndexError, TypeError):
-            continue
-
-    if not clip:
-        return {}
-
-    result: dict = {}
-    meta_block = clip.get("metadata", {}) or {}
-    style = meta_block.get("tags") or clip.get("tags") or clip.get("style") or ""
-    if style:
-        result["style"] = style
-    title = clip.get("title", "")
-    if title:
-        result["title"] = title
-    lyrics = meta_block.get("prompt") or clip.get("lyrics") or ""
-    if lyrics:
-        result["lyrics"] = lyrics
-    prompt = clip.get("prompt") or meta_block.get("gpt_description_prompt") or ""
-    if prompt and prompt != lyrics:
-        result["prompt"] = prompt
-
-    return result
-
-
-def fetch_sunoapi_meta(suno_id: str, base_url: str) -> dict:
-    """gcui-art/suno-api の /api/clip エンドポイントからメタデータを取得する.
-
-    Args:
-        suno_id: SunoのクリップID（UUIDまたは短縮形）。
-        base_url: suno-api サーバーのベースURL（例: "http://localhost:3000"）。
-                  末尾スラッシュは不要。
-
-    Returns:
-        取得できたフィールドのみ含むdict。失敗時は空dict。
-        キー: "title", "lyrics", "style", "prompt", "audio_url"
-
-    Note:
-        gcui-art/suno-api はセルフホスト型の非公式ラッパーであり、
-        SUNO_COOKIE を設定してユーザー自身が立ち上げたサーバーが必要。
-        レスポンスの歌詞フィールドは "lyric"（単数形）であることに注意。
-    """
-    try:
-        import requests as _requests
-    except ImportError:
-        return {}
-
-    url = f"{base_url.rstrip('/')}/api/clip"
-    try:
-        resp = _requests.get(url, params={"id": suno_id}, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return {}
-
-    # /api/clip は単一オブジェクト、/api/get は配列の場合があるため両方に対応
-    if isinstance(data, list):
-        data = data[0] if data else {}
-
-    result: dict = {}
-    if data.get("title"):
-        result["title"] = data["title"]
-    # 歌詞フィールドは "lyric"（単数）または "lyrics"（複数）が混在する
-    lyric = data.get("lyric") or data.get("lyrics") or ""
-    if lyric:
-        result["lyrics"] = lyric
-    tags = data.get("tags") or data.get("style") or ""
-    if tags:
-        result["style"] = tags
-    prompt = data.get("prompt") or ""
-    if prompt and prompt != lyric:
-        result["prompt"] = prompt
-    audio_url = data.get("audio_url") or ""
-    if audio_url and data.get("status") == "complete":
-        result["audio_url"] = audio_url
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# 音声からBPM・キーを自動推定
-# ---------------------------------------------------------------------------
-
-def estimate_bpm(wav_path: pathlib.Path) -> Optional[float]:
-    """librosaでBPMを推定する."""
-    try:
-        import librosa
-        import numpy as np
-        y, sr = librosa.load(str(wav_path), sr=None, mono=True, duration=60)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        return float(np.squeeze(tempo))
-    except Exception:
-        return None
-
-
-_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-_MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
-_MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
-
-
-def estimate_key(wav_path: pathlib.Path) -> Optional[str]:
-    """クロマ特徴量からKrumhansl-Schmucklerアルゴリズムでキーを推定する."""
-    try:
-        import librosa
-        import numpy as np
-        y, sr = librosa.load(str(wav_path), sr=None, mono=True, duration=60)
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-        chroma_mean = chroma.mean(axis=1)
-        major = np.array(_MAJOR_PROFILE)
-        minor = np.array(_MINOR_PROFILE)
-        best_score = -999.0
-        best_key = "C major"
-        for i in range(12):
-            rotated = np.roll(chroma_mean, -i)
-            score_maj = float(np.corrcoef(rotated, major)[0, 1])
-            score_min = float(np.corrcoef(rotated, minor)[0, 1])
-            if score_maj > best_score:
-                best_score = score_maj
-                best_key = f"{_NOTE_NAMES[i]} major"
-            if score_min > best_score:
-                best_score = score_min
-                best_key = f"{_NOTE_NAMES[i]} minor"
-        return best_key
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# URL判定・ID抽出
-# ---------------------------------------------------------------------------
-
-_SUNO_URL_RE = re.compile(
-    r"https?://(?:www\.)?suno\.(?:com|ai)/(?:song|track)/([a-zA-Z0-9_-]+)"
-)
-
-
-def extract_suno_id(url_or_id: str) -> str:
-    """SunoのURLまたはIDからIDを抽出する."""
-    m = _SUNO_URL_RE.search(url_or_id)
-    if m:
-        return m.group(1)
-    uuid_m = re.search(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        url_or_id, re.IGNORECASE,
-    )
-    if uuid_m:
-        return uuid_m.group(0)
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", url_or_id)[:64]
-
-
-# ---------------------------------------------------------------------------
-# yt-dlpによるダウンロード
-# ---------------------------------------------------------------------------
-
-def download_from_url(url: str, output_dir: pathlib.Path) -> pathlib.Path:
-    """yt-dlpでSunoのURLからMP3をダウンロードする."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_template = str(output_dir / "%(title)s.%(ext)s")
-    try:
-        subprocess.run(
-            ["yt-dlp", "--extract-audio", "--audio-format", "mp3",
-             "--audio-quality", "0", "-o", output_template, url],
-            capture_output=True, text=True, check=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("yt-dlpが見つかりません。`pip install yt-dlp`") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"yt-dlpダウンロード失敗:\n{exc.stderr}") from exc
-    mp3_files = sorted(output_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
-    if not mp3_files:
-        raise RuntimeError(f"ダウンロード後にMP3が見つかりません: {output_dir}")
-    return mp3_files[-1]
-
-
-# ---------------------------------------------------------------------------
-# 歌詞テキストのクリーニング
-# ---------------------------------------------------------------------------
-
-_SECTION_RE = re.compile(r"^\[.+?\]$", re.MULTILINE)
-
-
-def clean_lyrics(raw: str) -> str:
-    """セクション記号（[Verse]等）を除去したプレーンテキストを返す."""
-    cleaned = _SECTION_RE.sub("", raw)
-    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
-
-def parse_style_tags(tags_str: str) -> list[str]:
-    """カンマ区切りのスタイルタグ文字列をリストに変換する."""
-    return [t.strip() for t in tags_str.split(",") if t.strip()]
-
-
-# ---------------------------------------------------------------------------
-# メタデータの保存・読み込み
-# ---------------------------------------------------------------------------
-
-def save_meta(meta: SunoMeta, output_dir: pathlib.Path) -> pathlib.Path:
-    """SunoMetaをYAMLファイルとして保存する."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    yaml_path = output_dir / f"{meta.suno_id}_meta.yaml"
-    with yaml_path.open("w", encoding="utf-8") as f:
-        yaml.dump(meta.to_yaml_dict(), f, allow_unicode=True,
-                  default_flow_style=False, sort_keys=False)
-    return yaml_path
-
-
-def load_meta(yaml_path: pathlib.Path) -> SunoMeta:
-    """YAMLファイルからSunoMetaを復元する."""
-    with yaml_path.open(encoding="utf-8") as f:
-        d = yaml.safe_load(f)
-    return SunoMeta.from_yaml_dict(d)
-
-
-# ---------------------------------------------------------------------------
-# メインAPI
-# ---------------------------------------------------------------------------
-
-def ingest(
-    source: str,
-    title: Optional[str],
-    lyrics_text: Optional[str],
-    output_dir: pathlib.Path,
-    style_tags: str = "",
-    prompt: Optional[str] = None,
-    created_at: Optional[str] = None,
-) -> tuple[pathlib.Path, SunoMeta]:
-    """Suno音源を取り込み、(WAVパス, SunoMeta) を返す.
-
-    BPMとキーは音声から自動解析する（手動指定不要）。
-    URLが渡された場合、title・lyrics・style・promptをページから自動取得する。
-    自動取得できない場合は引数の値を使う。title未指定時はsuno_idを代用する。
-    """
-    import datetime
-
-    output_dir = pathlib.Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if created_at is None:
-        created_at = datetime.datetime.now().isoformat(timespec="seconds")
-
-    suno_id = extract_suno_id(source)
-
-    if source.startswith("http"):
-        page_meta = fetch_suno_page_meta(source)
-        if not title and page_meta.get("title"):
-            title = page_meta["title"]
-        if not lyrics_text and page_meta.get("lyrics"):
-            lyrics_text = page_meta["lyrics"]
-        if not style_tags and page_meta.get("style"):
-            style_tags = page_meta["style"]
-        if prompt is None:
-            prompt = page_meta.get("prompt")
-        mp3_path = download_from_url(source, output_dir)
-        suno_url = source
-    else:
-        mp3_path = pathlib.Path(source)
-        if not mp3_path.exists():
-            raise FileNotFoundError(f"入力ファイルが見つかりません: {mp3_path}")
-        suno_url = None
-
-    # フォールバック
-    if not title:
-        title = suno_id
-    if not lyrics_text:
-        lyrics_text = ""
-
-    from retranscribe.preprocess import to_wav
-    wav_path = to_wav(mp3_path, output_dir)
-
-    bpm_hint = estimate_bpm(wav_path)
-    key_hint = estimate_key(wav_path)
-
-    meta = SunoMeta(
-        title=title,
-        suno_id=suno_id,
-        lyrics_raw=lyrics_text,
-        style_tags=parse_style_tags(style_tags),
-        bpm_hint=bpm_hint,
-        key_hint=key_hint,
-        prompt=prompt,
-        suno_url=suno_url,
-        created_at=created_at,
-    )
-
-    save_meta(meta, output_dir)
-    return wav_path, meta
+  """Suno音源の取り込みモジュール.
+
+  機能:
+  - Suno URLからyt-dlpでMP3取得（オプション）
+  - SunoページHTMLから__NEXT_DATA__経由でスタイルタグ自動取得
+  - gcui-art/suno-api の /api/clip エンドポイントからメタデータ補完
+  - ローカルMP3ファイルの受け取り
+  - 歌詞テキストの受け取りとYAML保存
+  - SunoメタデータのDataclass化
+  - BPMとキーの音声解析による自動推定
+  - ffmpegによるWAV正規化（preprocess.pyへ委譲）
+  """
+
+  from __future__ import annotations
+
+  import re
+  import subprocess
+  import pathlib
+  import dataclasses
+  from typing import Optional
+  import yaml
+
+
+  # ---------------------------------------------------------------------------
+  # データモデル
+  # ---------------------------------------------------------------------------
+
+  @dataclasses.dataclass
+  class SunoMeta:
+      """Sunoの1曲分のメタデータ."""
+
+      title: str
+      suno_id: str
+      lyrics_raw: str
+      style_tags: list[str]
+      bpm_hint: Optional[float]       # 音声解析で自動推定
+      key_hint: Optional[str]         # 音声解析で自動推定
+      prompt: Optional[str]
+      suno_url: Optional[str]
+      created_at: str
+      # suno-api から取得する追加フィールド
+      model_name: Optional[str] = None    # 例: "chirp-crow"
+      duration: Optional[float] = None    # 秒（例: 207.32）
+      image_url: Optional[str] = None     # CDN上のジャケット画像URL
+      audio_url: Optional[str] = None     # CDN上のMP3 URL
+      video_url: Optional[str] = None     # CDN上のMP4 URL
+
+      def to_yaml_dict(self) -> dict:
+          return dataclasses.asdict(self)
+
+      @classmethod
+      def from_yaml_dict(cls, d: dict) -> "SunoMeta":
+          # 旧バージョンの YAML（追加フィールドなし）との後方互換
+          known = {f.name for f in dataclasses.fields(cls)}
+          return cls(**{k: v for k, v in d.items() if k in known})
+
+      def update_lyrics(self, text: str) -> None:
+          """WhisperX 書き起こし結果で lyrics_raw を上書きする."""
+          self.lyrics_raw = text
+
+
+  # ---------------------------------------------------------------------------
+  # Sunoページからのメタデータ自動取得
+  # ---------------------------------------------------------------------------
+
+  def fetch_suno_page_meta(url: str) -> dict:
+      """SunoページのHTMLを取得し、__NEXT_DATA__ JSONからメタデータを抽出する.
+
+      Returns:
+          取得できたフィールドのみ含むdict。空dictの場合は取得失敗。
+
+      Note:
+          Sunoはログイン必須のページに移行しつつある。
+          セッションクッキーなしでアクセスできない場合は空dictを返す。
+          ページ構造はSunoのデプロイで変わりうるため、失敗時はスキップする。
+      """
+      try:
+          import requests
+      except ImportError:
+          return {}
+
+      headers = {
+          "User-Agent": (
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/123.0.0.0 Safari/537.36"
+          )
+      }
+      try:
+          resp = requests.get(url, headers=headers, timeout=10)
+          resp.raise_for_status()
+      except Exception:
+          return {}
+
+      m = re.search(
+          r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>',
+          resp.text,
+          re.DOTALL,
+      )
+      if not m:
+          return {}
+
+      try:
+          import json
+          data = json.loads(m.group(1))
+      except Exception:
+          return {}
+
+      clip = None
+      candidates = [
+          lambda d: d["props"]["pageProps"]["clip"],
+          lambda d: d["props"]["pageProps"]["initialData"]["clips"][0],
+          lambda d: list(d["props"]["pageProps"]["initialData"].values())[0],
+      ]
+      for getter in candidates:
+          try:
+              clip = getter(data)
+              if clip:
+                  break
+          except (KeyError, IndexError, TypeError):
+              continue
+
+      if not clip:
+          return {}
+
+      result: dict = {}
+      meta_block = clip.get("metadata", {}) or {}
+      style = meta_block.get("tags") or clip.get("tags") or clip.get("style") or ""
+      if style:
+          result["style"] = style
+      title = clip.get("title", "")
+      if title:
+          result["title"] = title
+      lyrics = meta_block.get("prompt") or clip.get("lyrics") or ""
+      if lyrics:
+          result["lyrics"] = lyrics
+      prompt = clip.get("prompt") or meta_block.get("gpt_description_prompt") or ""
+      if prompt and prompt != lyrics:
+          result["prompt"] = prompt
+
+      return result
+
+
+  # ---------------------------------------------------------------------------
+  # fetch_sunoapi_meta ヘルパー
+  # ---------------------------------------------------------------------------
+
+  _SUNO_META_LINE_RE = re.compile(r"^--[^-].*--\s*$", re.MULTILINE)
+  _STYLE_GENRE_RE = re.compile(
+      r"\[STYLE\s*/\s*GENRE\][^\n]*\n([^\n\[]+)", re.IGNORECASE
+  )
+
+
+  def _remove_suno_meta_lines(text: str) -> str:
+      """Sunoが付与する "-- ... --" 形式の指示行を除去し、先頭の空行を詰める."""
+      cleaned = _SUNO_META_LINE_RE.sub("", text)
+      return re.sub(r"^\n+", "", cleaned).strip()
+
+
+  def _normalize_text(text: str) -> str:
+      """空白・改行を除去して正規化する（prompt と lyric の重複判定用）."""
+      return re.sub(r"\s+", "", text)
+
+
+  def _extract_style_from_tags(tags: str) -> str:
+      """tags フィールドからスタイル文字列を抽出する.
+
+      "[STYLE / GENRE]" セクション直後の最初の非空行をカンマ区切りタグとして返す。
+      セクション構造がない場合（短い文字列）はそのまま返す。
+      """
+      m = _STYLE_GENRE_RE.search(tags)
+      if m:
+          line = m.group(1).strip()
+          line = re.sub(r"\s*[×/]\s*", ", ", line)
+          line = re.sub(r"\s+with\b.*$", "", line, flags=re.IGNORECASE)
+          return line.strip().rstrip(",")
+      return tags[:100].strip()
+
+
+  def fetch_sunoapi_meta(suno_id: str, base_url: str) -> tuple[dict, Optional[str]]:
+      """gcui-art/suno-api の /api/get?ids= からメタデータを取得する.
+
+      Args:
+          suno_id: SunoのクリップID（UUID形式）。
+          base_url: suno-api サーバーのベースURL（例: "http://localhost:4000"）。
+
+      Returns:
+          (result_dict, error_message) のタプル。
+          成功時は (フィールドを含むdict, None)。
+          失敗時は ({}, エラー内容の文字列)。
+      """
+      try:
+          import requests as _requests
+      except ImportError:
+          return {}, "requests がインストールされていません"
+
+      base = base_url.rstrip("/")
+      endpoint = f"{base}/api/get"
+
+      try:
+          resp = _requests.get(endpoint, params={"ids": suno_id}, timeout=10)
+      except Exception as exc:
+          return {}, f"接続失敗 ({endpoint}): {exc}"
+
+      if not resp.ok:
+          return {}, f"HTTP {resp.status_code} ({endpoint})"
+
+      try:
+          payload = resp.json()
+      except Exception as exc:
+          return {}, f"JSONパース失敗: {exc}"
+
+      if isinstance(payload, list):
+          if not payload:
+              return {}, f"空配列が返されました (id={suno_id})"
+          data = payload[0]
+      elif isinstance(payload, dict):
+          data = payload
+      else:
+          return {}, f"予期しないレスポンス型: {type(payload)}"
+
+      if not data:
+          return {}, "空オブジェクトが返されました"
+
+      result: dict = {}
+
+      if data.get("title"):
+          result["title"] = data["title"]
+
+      lyric_raw = data.get("lyric") or data.get("lyrics") or ""
+      if lyric_raw:
+          lyric_clean = _remove_suno_meta_lines(lyric_raw)
+          if lyric_clean:
+              result["lyrics"] = lyric_clean
+
+      tags_raw = data.get("tags") or data.get("style") or ""
+      if tags_raw:
+          result["style"] = _extract_style_from_tags(tags_raw)
+
+      prompt_raw = data.get("prompt") or data.get("gpt_description_prompt") or ""
+      if prompt_raw:
+          prompt_clean = _remove_suno_meta_lines(prompt_raw)
+          lyric_clean = result.get("lyrics", "")
+          if _normalize_text(prompt_clean) != _normalize_text(lyric_clean):
+              result["prompt"] = prompt_clean
+
+      if data.get("audio_url") and data.get("status") == "complete":
+          result["audio_url"] = data["audio_url"]
+      if data.get("video_url"):
+          result["video_url"] = data["video_url"]
+      if data.get("image_url"):
+          result["image_url"] = data["image_url"]
+      if data.get("model_name"):
+          result["model_name"] = data["model_name"]
+      if data.get("duration") is not None:
+          result["duration"] = float(data["duration"])
+      if data.get("created_at"):
+          result["created_at"] = data["created_at"]
+
+      return result, None
+
+
+  # ---------------------------------------------------------------------------
+  # 音声からBPM・キーを自動推定
+  # ---------------------------------------------------------------------------
+
+  def estimate_bpm(wav_path: pathlib.Path) -> Optional[float]:
+      """librosaでBPMを推定する."""
+      try:
+          import librosa
+          import numpy as np
+          y, sr = librosa.load(str(wav_path), sr=None, mono=True, duration=60)
+          tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+          return float(np.squeeze(tempo))
+      except Exception:
+          return None
+
+
+  _NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+  _MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+  _MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+  def estimate_key(wav_path: pathlib.Path) -> Optional[str]:
+      """クロマ特徴量からKrumhansl-Schmucklerアルゴリズムでキーを推定する."""
+      try:
+          import librosa
+          import numpy as np
+          y, sr = librosa.load(str(wav_path), sr=None, mono=True, duration=60)
+          chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+          chroma_mean = chroma.mean(axis=1)
+          major = np.array(_MAJOR_PROFILE)
+          minor = np.array(_MINOR_PROFILE)
+          best_score = -999.0
+          best_key = "C major"
+          for i in range(12):
+              rotated = np.roll(chroma_mean, -i)
+              score_maj = float(np.corrcoef(rotated, major)[0, 1])
+              score_min = float(np.corrcoef(rotated, minor)[0, 1])
+              if score_maj > best_score:
+                  best_score = score_maj
+                  best_key = f"{_NOTE_NAMES[i]} major"
+              if score_min > best_score:
+                  best_score = score_min
+                  best_key = f"{_NOTE_NAMES[i]} minor"
+          return best_key
+      except Exception:
+          return None
+
+
+  # ---------------------------------------------------------------------------
+  # URL判定・ID抽出
+  # ---------------------------------------------------------------------------
+
+  _SUNO_URL_RE = re.compile(
+      r"https?://(?:www\.)?suno\.(?:com|ai)/(?:song|track)/([a-zA-Z0-9_-]+)"
+  )
+
+
+  def extract_suno_id(url_or_id: str) -> str:
+      """SunoのURLまたはIDからIDを抽出する."""
+      m = _SUNO_URL_RE.search(url_or_id)
+      if m:
+          return m.group(1)
+      uuid_m = re.search(
+          r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+          url_or_id, re.IGNORECASE,
+      )
+      if uuid_m:
+          return uuid_m.group(0)
+      return re.sub(r"[^a-zA-Z0-9_-]", "_", url_or_id)[:64]
+
+
+  # ---------------------------------------------------------------------------
+  # yt-dlpによるダウンロード
+  # ---------------------------------------------------------------------------
+
+  def download_from_url(url: str, output_dir: pathlib.Path) -> pathlib.Path:
+      """yt-dlpでSunoのURLからMP3をダウンロードする."""
+      output_dir.mkdir(parents=True, exist_ok=True)
+      output_template = str(output_dir / "%(title)s.%(ext)s")
+      try:
+          subprocess.run(
+              ["yt-dlp", "--extract-audio", "--audio-format", "mp3",
+               "--audio-quality", "0", "-o", output_template, url],
+              capture_output=True, text=True, check=True,
+          )
+      except FileNotFoundError as exc:
+          raise RuntimeError("yt-dlpが見つかりません。`pip install yt-dlp`") from exc
+      except subprocess.CalledProcessError as exc:
+          raise RuntimeError(f"yt-dlpダウンロード失敗:\n{exc.stderr}") from exc
+      mp3_files = sorted(output_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+      if not mp3_files:
+          raise RuntimeError(f"ダウンロード後にMP3が見つかりません: {output_dir}")
+      return mp3_files[-1]
+
+
+  # ---------------------------------------------------------------------------
+  # 歌詞テキストのクリーニング
+  # ---------------------------------------------------------------------------
+
+  _SECTION_RE = re.compile(r"^\[.+?\]$", re.MULTILINE)
+
+
+  def clean_lyrics(raw: str) -> str:
+      """セクション記号（[Verse]等）を除去したプレーンテキストを返す."""
+      cleaned = _SECTION_RE.sub("", raw)
+      return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+  def parse_style_tags(tags_str: str) -> list[str]:
+      """カンマ区切りのスタイルタグ文字列をリストに変換する."""
+      return [t.strip() for t in tags_str.split(",") if t.strip()]
+
+
+  # ---------------------------------------------------------------------------
+  # メタデータの保存・読み込み
+  # ---------------------------------------------------------------------------
+
+  def save_meta(meta: SunoMeta, output_dir: pathlib.Path) -> pathlib.Path:
+      """SunoMetaをYAMLファイルとして保存する."""
+      output_dir.mkdir(parents=True, exist_ok=True)
+      yaml_path = output_dir / f"{meta.suno_id}_meta.yaml"
+      with yaml_path.open("w", encoding="utf-8") as f:
+          yaml.dump(meta.to_yaml_dict(), f, allow_unicode=True,
+                    default_flow_style=False, sort_keys=False)
+      return yaml_path
+
+
+  def load_meta(yaml_path: pathlib.Path) -> SunoMeta:
+      """YAMLファイルからSunoMetaを復元する."""
+      with yaml_path.open(encoding="utf-8") as f:
+          d = yaml.safe_load(f)
+      return SunoMeta.from_yaml_dict(d)
+
+
+  # ---------------------------------------------------------------------------
+  # メインAPI
+  # ---------------------------------------------------------------------------
+
+  def ingest(
+      source: str,
+      title: Optional[str],
+      lyrics_text: Optional[str],
+      output_dir: pathlib.Path,
+      style_tags: str = "",
+      prompt: Optional[str] = None,
+      created_at: Optional[str] = None,
+      suno_api_url: Optional[str] = None,
+  ) -> tuple[pathlib.Path, SunoMeta]:
+      """Suno音源を取り込み、(WAVパス, SunoMeta) を返す.
+
+      source に https://suno.com/song/<id> を渡した場合の処理順:
+        1. extract_suno_id() で suno_id を抽出
+        2. suno_api_url が指定されていれば fetch_sunoapi_meta() でメタデータ・audio_url 取得
+        3. audio_url を yt-dlp でダウンロード（取得できた場合）
+        4. 取得できなかった場合は source URL を yt-dlp に渡す（従来フォールバック）
+        5. BPM・Key は WAV 変換後に音声解析で自動推定
+
+      ローカルファイルを渡した場合は 2-4 をスキップする。
+      """
+      import datetime
+
+      output_dir = pathlib.Path(output_dir)
+      output_dir.mkdir(parents=True, exist_ok=True)
+
+      suno_id = extract_suno_id(source)
+      suno_url = source if source.startswith("http") else None
+
+      # suno-api から優先取得（URL指定かつ suno_api_url 設定時）
+      api_meta: dict = {}
+      if suno_url and suno_api_url:
+          api_meta, api_error = fetch_sunoapi_meta(suno_id, suno_api_url)
+          if api_error:
+              import warnings
+              warnings.warn(
+                  f"suno-api メタデータ取得失敗 [{suno_api_url}]: {api_error}",
+                  RuntimeWarning, stacklevel=2,
+              )
+
+      # メタデータの優先度: 引数 > suno-api > ページスクレイピング
+      if not title:
+          title = api_meta.get("title")
+      if not lyrics_text:
+          lyrics_text = api_meta.get("lyrics", "")
+      if not style_tags:
+          style_tags = api_meta.get("style", "")
+      if prompt is None:
+          prompt = api_meta.get("prompt")
+      if created_at is None:
+          # suno-api の created_at はISO8601形式（"2025-12-08T04:29:24.145Z"）
+          created_at = api_meta.get("created_at")
+      if created_at is None:
+          created_at = datetime.datetime.now().isoformat(timespec="seconds")
+
+      # 音源取得
+      if suno_url:
+          # suno-api から audio_url が取得できた場合はそちらを直接ダウンロード
+          download_target = api_meta.get("audio_url") or suno_url
+          # yt-dlp は HTTP(S) URL を受け取る。suno CDN MP3 URL は直接 wget でも取得可能だが
+          # yt-dlp の --extract-audio を通すことで再サンプリング・フォーマット統一を保証する
+          mp3_path = download_from_url(download_target, output_dir)
+      else:
+          mp3_path = pathlib.Path(source)
+          if not mp3_path.exists():
+              raise FileNotFoundError(f"入力ファイルが見つかりません: {mp3_path}")
+
+      # ページスクレイピング（suno-api で取得できなかったフィールドの補完）
+      if suno_url and not api_meta:
+          page_meta = fetch_suno_page_meta(suno_url)
+          if not title:
+              title = page_meta.get("title")
+          if not lyrics_text:
+              lyrics_text = page_meta.get("lyrics", "")
+          if not style_tags:
+              style_tags = page_meta.get("style", "")
+          if prompt is None:
+              prompt = page_meta.get("prompt")
+
+      # フォールバック
+      if not title:
+          title = suno_id
+      if not lyrics_text:
+          lyrics_text = ""
+
+      from retranscribe.preprocess import to_wav
+      wav_path = to_wav(mp3_path, output_dir)
+
+      bpm_hint = estimate_bpm(wav_path)
+      key_hint = estimate_key(wav_path)
+
+      meta = SunoMeta(
+          title=title,
+          suno_id=suno_id,
+          lyrics_raw=lyrics_text,
+          style_tags=parse_style_tags(style_tags),
+          bpm_hint=bpm_hint,
+          key_hint=key_hint,
+          prompt=prompt,
+          suno_url=suno_url,
+          created_at=created_at,
+          model_name=api_meta.get("model_name"),
+          duration=api_meta.get("duration"),
+          image_url=api_meta.get("image_url"),
+          audio_url=api_meta.get("audio_url"),
+          video_url=api_meta.get("video_url"),
+      )
+
+      save_meta(meta, output_dir)
+      return wav_path, meta
 #+END_SRC
 
 ** suno/pitch_fix.py — AI 生成音声の F0 安定化
@@ -2235,11 +2342,11 @@ def ingest_and_transcribe(
 ) -> None:
     """Suno音源を採譜してMIDI/MusicXML/Orgライブラリに追加する.
 
-    --source にURLまたはローカルMP3を指定する。
-    --suno-id のみ指定した場合は gcui-art/suno-api 経由でメタデータ・音源URLを補完し、
-    yt-dlp でダウンロードする（suno-api サーバーが SUNO_COOKIE 付きで起動済みであること）。
-    --source と --suno-id を同時指定した場合は --source を音源として使い、
-    メタデータのみ suno-api で補完する。
+    --source に https://suno.com/song/<id> を指定した場合、
+    --suno-api-url が設定されていれば suno-api の /api/get?ids= を叩いて
+    title・lyrics・style・created_at・duration・image_url・audio_url を自動取得し、
+    audio_url を音源としてパイプラインを実行する。
+    --suno-id を別途指定した場合は --source 未指定でも補完として使用できる。
     """
     import warnings
     if not verbose:
@@ -2250,6 +2357,11 @@ def ingest_and_transcribe(
         console.print("[red]--source または --suno-id のいずれかを指定してください。[/red]")
         raise typer.Exit(1)
 
+    # --suno-id のみ指定の場合は suno URL に変換して source とする
+    if not source and suno_id:
+        source = f"https://suno.com/song/{suno_id}"
+        console.print(f"  [dim]--suno-id から source を解決: {source}[/dim]")
+
     # 歌詞ファイルが指定されている場合のみ読み込む
     lyrics_text: Optional[str] = None
     if lyrics is not None:
@@ -2257,48 +2369,6 @@ def ingest_and_transcribe(
             console.print(f"[red]歌詞ファイルが見つかりません: {lyrics}[/red]")
             raise typer.Exit(1)
         lyrics_text = lyrics.read_text(encoding="utf-8")
-
-    # ---------------------------------------------------------------------------
-    # suno-api によるメタデータ・音源URL補完
-    # --suno-id が指定された場合、gcui-art/suno-api の /api/clip で補完を試みる。
-    # --source 未指定かつ audio_url が取得できた場合は audio_url を source に充てる。
-    # --source 指定済みの場合はメタデータのみ補完する。
-    # ---------------------------------------------------------------------------
-    _resolved_suno_id = suno_id
-    if suno_id:
-        console.print(f"  [dim]suno-api ({suno_api_url}) でメタデータを補完中...[/dim]")
-        from retranscribe.suno.ingest import fetch_sunoapi_meta
-        api_meta = fetch_sunoapi_meta(suno_id, suno_api_url)
-
-        if api_meta:
-            if not title and api_meta.get("title"):
-                title = api_meta["title"]
-                console.print(f"  [dim]title 補完: {title}[/dim]")
-            if not lyrics_text and api_meta.get("lyrics"):
-                lyrics_text = api_meta["lyrics"]
-                console.print("  [dim]lyrics 補完: suno-api から取得[/dim]")
-            if not style and api_meta.get("style"):
-                style = api_meta["style"]
-                console.print(f"  [dim]style 補完: {style}[/dim]")
-            if prompt is None and api_meta.get("prompt"):
-                prompt = api_meta["prompt"]
-            if not source and api_meta.get("audio_url"):
-                source = api_meta["audio_url"]
-                console.print(f"  [dim]source 補完: audio_url を使用 → {source}[/dim]")
-        else:
-            console.print(
-                f"  [yellow]suno-api からメタデータを取得できませんでした"
-                f" (url={suno_api_url}, id={suno_id})。"
-                f" SUNO_COOKIE 設定とサーバー稼働を確認してください。[/yellow]"
-            )
-
-    # suno-api 補完後も source が未解決の場合はエラー
-    if not source:
-        console.print(
-            "[red]音源が解決できませんでした。--source でMP3/WAVを指定するか、"
-            "suno-api で audio_url を取得できる状態にしてください。[/red]"
-        )
-        raise typer.Exit(1)
 
     # output_dir は ingest() 後に title が確定してから決定する
     _output_dir = output_dir
@@ -2317,15 +2387,31 @@ def ingest_and_transcribe(
     ) as progress:
         task = progress.add_task("開始...", total=steps)
 
-        # 1. Suno取り込み（title/lyrics/style自動取得 + BPM・Key自動解析）
+        # 1. Suno取り込み（suno-api でメタデータ取得 + BPM・Key自動解析）
         progress.update(task, description="[cyan]Suno取り込み[/cyan] (ingest + BPM/Key解析) ...")
-        from retranscribe.suno.ingest import ingest, extract_suno_id
-        # output_dir が未指定の場合は仮ディレクトリで ingest し、title 確定後に移動
+        from retranscribe.suno.ingest import ingest, extract_suno_id, fetch_sunoapi_meta
         _suno_id = extract_suno_id(source)
+
+        # suno-api 疎通確認（進捗表示の外で先に実行して結果を表示）
+        if suno_api_url:
+            _api_meta, _api_error = fetch_sunoapi_meta(_suno_id, suno_api_url)
+            if _api_error:
+                console.print(
+                    f"  [yellow]suno-api 取得失敗: {_api_error}[/yellow]\n"
+                    f"  [yellow]→ --suno-api-url ({suno_api_url}) とサーバーの稼働を確認してください[/yellow]"
+                )
+            else:
+                console.print(
+                    f"  [dim]suno-api 取得成功: title={_api_meta.get('title')} / "
+                    f"duration={_api_meta.get('duration')}s[/dim]"
+                )
+
+        # output_dir が未指定の場合は仮ディレクトリで ingest し、title 確定後に移動
         _tmp_dir = _output_dir or pathlib.Path("suno_output") / _suno_id
         wav_path, meta = ingest(
             source=source, title=title, lyrics_text=lyrics_text,
             output_dir=_tmp_dir, style_tags=style, prompt=prompt,
+            suno_api_url=suno_api_url,
         )
         # title が自動取得された場合、output_dir を確定
         if _output_dir is None:
@@ -2437,8 +2523,11 @@ if __name__ == "__main__":
 - Suno の =__NEXT_DATA__= スクレイピングはページ構造変更で無効化される可能性がある
 - =gcui-art/suno-api= 連携は非公式ラッパーであり、ユーザー自身が SUNO_COOKIE を設定して
   サーバーを立ち上げる必要がある。Suno の利用規約の範囲内で使用すること
-- =fetch_sunoapi_meta()= の歌詞フィールドは ="/lyric"= （単数形）と ="/lyrics"= （複数形）が
-  suno-api のバージョンにより混在する可能性があるため、両方を参照している
+- =gcui-art/suno-api= 連携は非公式ラッパーであり、ユーザー自身が SUNO_COOKIE を設定して
+  サーバーを立ち上げる必要がある。デフォルトポートは 4000。Suno の利用規約の範囲内で使用すること
+- =fetch_sunoapi_meta()= は =(dict, Optional[str])= を返す。失敗時のエラー理由は warning として
+  表示され、CLI では進捗表示前に黄色メッセージで通知される
+- =lyric= フィールド冒頭の ="-- ... --"= 形式のSuno内部指示行は自動除去される
 - magenta（Onsets and Frames）は pip install magenta で別途手動インストールが必要
 - torchaudio は 2.7 系に固定（LazyModule resample エラー回避のため）
 - madmom は build 時に Cython と numpy が必要（=uv.extra-build-dependencies= で対処済み）
